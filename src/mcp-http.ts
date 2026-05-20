@@ -75,6 +75,14 @@ interface SessionContext {
 const JSON_RPC_INVALID = -32600;
 const JSON_RPC_METHOD_NOT_FOUND = -32601;
 
+/** Strip everything except `[a-zA-Z0-9]`. Mirrors matrix's
+ *  `sanitizeToolCallId` (strict mode) so we can fuzzy-match a sanitized
+ *  tool_call_id from the OAI caller against the canonical anthropic
+ *  `toolu_*` id the CLI registered. */
+function sanitizeId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9]/g, "");
+}
+
 export class BridgeMcpHttpServer {
   private server: Server | null = null;
   private actualPort = 0;
@@ -167,13 +175,13 @@ export class BridgeMcpHttpServer {
   async waitForPending(sessionKey: string, toolUseId: string, timeoutMs = 10_000): Promise<void> {
     const ctx = this.sessions.get(sessionKey);
     if (!ctx) throw new Error(`session not registered: ${sessionKey}`);
-    if (ctx.pending.has(toolUseId)) return;
+    if (this.findPending(ctx, toolUseId)) return;
     const deadline = Date.now() + timeoutMs;
     // Tight polling is fine here: the MCP POST usually lands within a few
     // event-loop ticks, and the only alternative (wiring per-id events)
     // bloats the pending-call data structure for a race that's ~ms wide.
     while (Date.now() < deadline) {
-      if (ctx.pending.has(toolUseId)) return;
+      if (this.findPending(ctx, toolUseId)) return;
       await new Promise((r) => setTimeout(r, 10));
     }
     throw new Error(`waitForPending timeout: ${toolUseId} did not arrive within ${timeoutMs}ms`);
@@ -199,10 +207,28 @@ export class BridgeMcpHttpServer {
   ): boolean {
     const ctx = this.sessions.get(sessionKey);
     if (!ctx) return false;
-    const pending = ctx.pending.get(toolUseId);
-    if (!pending) return false;
+    const match = this.findPending(ctx, toolUseId);
+    if (!match) return false;
+    const { pending, key, matchedBy } = match;
+    if (matchedBy === "fuzzy") {
+      // Critical: matrix (and other OpenAI-compatible clients) may strip
+      // non-alphanumeric chars from tool_call_id before sending tool_result
+      // back. The bridge stores pending under the canonical anthropic
+      // `toolu_*` id from the CLI; without fuzzy lookup we'd think the
+      // pending was missing and trigger an orphan-recovery respawn.
+      process.stdout.write(
+        `${JSON.stringify({
+          ts: new Date().toISOString(),
+          level: "info",
+          msg: "MCP resolve via fuzzy match",
+          sessionKey,
+          lookupId: toolUseId,
+          canonicalId: key,
+        })}\n`,
+      );
+    }
     if (pending.resolved) {
-      ctx.pending.delete(toolUseId);
+      ctx.pending.delete(key);
       return true;
     }
     this.finishResponse(pending, {
@@ -211,7 +237,7 @@ export class BridgeMcpHttpServer {
         isError: false,
       },
     });
-    ctx.pending.delete(toolUseId);
+    ctx.pending.delete(key);
     return true;
   }
 
@@ -219,15 +245,64 @@ export class BridgeMcpHttpServer {
   rejectToolCall(sessionKey: string, toolUseId: string, message: string): void {
     const ctx = this.sessions.get(sessionKey);
     if (!ctx) throw new Error(`session not registered: ${sessionKey}`);
-    const pending = ctx.pending.get(toolUseId);
-    if (!pending || pending.resolved) return;
-    this.finishResponse(pending, {
+    const match = this.findPending(ctx, toolUseId);
+    if (!match || match.pending.resolved) return;
+    this.finishResponse(match.pending, {
       result: {
         content: [{ type: "text", text: message }],
         isError: true,
       },
     });
-    ctx.pending.delete(toolUseId);
+    ctx.pending.delete(match.key);
+  }
+
+  /** Locate a pending entry by `toolUseId`. Tries exact match first; if that
+   *  fails, falls back to alphanumeric-only comparison so we tolerate OAI
+   *  clients that strip `[^a-zA-Z0-9]` (matrix's
+   *  `sanitizeToolCallIdsForCloudCodeAssist` with `strict` mode does this,
+   *  turning `toolu_01ABC...` into `toolu01ABC...` on tool_result delivery).
+   *
+   *  The fuzzy fallback iterates the pending map — typically 0-2 entries
+   *  during normal flow under `--max-turns 1`, so the linear scan is fine.
+   *  On ambiguous matches (extremely unlikely for native anthropic ids), we
+   *  prefer the most recently-added pending (highest seq) and log a warning
+   *  so the operator can investigate. */
+  private findPending(
+    ctx: SessionContext,
+    lookupId: string,
+  ): { pending: PendingCall; key: string; matchedBy: "exact" | "fuzzy" } | undefined {
+    const exact = ctx.pending.get(lookupId);
+    if (exact) return { pending: exact, key: lookupId, matchedBy: "exact" };
+
+    // No early-exit on "lookupId is already sanitized". The COMMON case is
+    // matrix sending the already-sanitized form (`toolu01ABC...`) and the
+    // canonical map keying it under `toolu_01ABC...`. We always want to fall
+    // back to the alphanumeric-only comparison.
+    const sanitizedLookup = sanitizeId(lookupId);
+    let bestMatch: { pending: PendingCall; key: string } | undefined;
+    let allMatches: Array<{ key: string; seq: number }> | undefined;
+    for (const [key, pending] of ctx.pending) {
+      if (sanitizeId(key) !== sanitizedLookup) continue;
+      if (!bestMatch || pending.seq > bestMatch.pending.seq) {
+        bestMatch = { pending, key };
+      }
+      (allMatches ??= []).push({ key, seq: pending.seq });
+    }
+    if (!bestMatch) return undefined;
+    if (allMatches && allMatches.length > 1) {
+      process.stdout.write(
+        `${JSON.stringify({
+          ts: new Date().toISOString(),
+          level: "warn",
+          msg: "MCP fuzzy lookup ambiguous, picking highest seq",
+          sessionKey: ctx.sessionKey,
+          lookupId,
+          candidates: allMatches,
+          picked: bestMatch.key,
+        })}\n`,
+      );
+    }
+    return { pending: bestMatch.pending, key: bestMatch.key, matchedBy: "fuzzy" };
   }
 
   // ─── HTTP handling ──────────────────────────────────────────────────────
