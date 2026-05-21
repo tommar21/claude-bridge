@@ -308,18 +308,6 @@ export class BridgeMcpHttpServer {
   // ─── HTTP handling ──────────────────────────────────────────────────────
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    // DIAGNOSTIC: log all incoming requests with method + accept header
-    process.stdout.write(
-      `${JSON.stringify({
-        ts: new Date().toISOString(),
-        level: "info",
-        msg: "MCP HTTP request",
-        method: req.method,
-        url: req.url,
-        accept: req.headers.accept,
-        contentType: req.headers["content-type"],
-      })}\n`,
-    );
     // CLI does a GET for SSE on the same URL as part of MCP HTTP transport
     // discovery; we don't need streaming, so reply with 405.
     if (req.method === "GET") {
@@ -447,11 +435,12 @@ export class BridgeMcpHttpServer {
       isSse,
     };
     // If a previous pending with the same toolUseId exists (CLI sent a
-    // duplicate POST), preserve its socket but stop tracking it in the map.
-    // The new pending becomes the canonical one for tryResolveToolCall.
-    // We do NOT close the old socket here — it may still receive a result
-    // if the CLI is actually listening on it; let it die naturally.
-    const prior = ctx.pending.get(toolUseId);
+    // duplicate POST after a respawn), the new pending becomes the canonical
+    // one for tryResolveToolCall. We do NOT close the old socket here — it
+    // may still receive a result if the CLI is actually listening on it;
+    // let it die naturally. (Duplicate-POST behavior is no longer expected
+    // post-v3.4.4 since orphan-recovery-driven respawns stopped, but the
+    // guard is cheap and defensive.)
     ctx.pending.set(toolUseId, pending);
     process.stdout.write(
       `${JSON.stringify({
@@ -463,40 +452,31 @@ export class BridgeMcpHttpServer {
         rpcId,
         seq,
         tool: name,
-        isSse,
-        priorSeq: prior?.seq ?? null,
-        priorResolved: prior?.resolved ?? null,
       })}\n`,
     );
 
     // If the client socket dies, drop the pending entry — but ONLY if the
     // map still points to this exact pending. With duplicate POSTs (same
     // toolUseId), POST1's close handler must NOT delete POST2's entry from
-    // the map. That race was silently dropping pending entries in
-    // production and caused ~50% orphanRecoveries.
+    // the map. Only log unexpected closes (warn); the happy-path resolve
+    // closes are silent now that v3.4.4 made them the norm.
     res.once("close", () => {
-      const ageMs = Date.now() - pending.receivedAt;
       const stillInMap = ctx.pending.get(toolUseId) === pending;
-      const wasResolved = pending.resolved;
-      if (!pending.resolved) {
-        pending.resolved = true;
-        if (stillInMap) ctx.pending.delete(toolUseId);
-      }
-      // Always log close events so we can see what happens to BOTH sockets
-      // when the CLI duplicates POSTs. This is intentionally noisy until
-      // the root cause of duplicate POSTs is understood; trim once stable.
+      if (pending.resolved) return;
+      pending.resolved = true;
+      if (stillInMap) ctx.pending.delete(toolUseId);
+      const ageMs = Date.now() - pending.receivedAt;
       process.stdout.write(
         `${JSON.stringify({
           ts: new Date().toISOString(),
-          level: wasResolved ? "info" : "warn",
-          msg: wasResolved ? "MCP pending close (already resolved)" : "MCP pending CLOSED before resolve",
+          level: "warn",
+          msg: "MCP pending CLOSED before resolve",
           sessionKey: ctx.sessionKey,
           toolUseId,
           rpcId,
           seq,
           ageMs,
           headersSent: res.headersSent,
-          writableEnded: res.writableEnded,
           stillInMap,
           isSse,
         })}\n`,
