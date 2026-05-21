@@ -20,12 +20,14 @@ const maxSessions = parseInt(
   10,
 );
 
-// Path D (persistent CLI per session + in-process MCP) is feature-flagged
-// off by default until we have real-traffic data. Flip CLAUDE_BRIDGE_PATH_D=1
-// in the env to turn it on. The plumbing always starts (MCP server + session
-// pool), but cli-worker.ts only routes to them when the flag is enabled.
-const pathDEnabled = /^(1|true|yes|on)$/i.test(
-  process.env.CLAUDE_BRIDGE_PATH_D ?? "",
+// Path D (persistent CLI per session + in-process MCP) is now the default
+// since v3.5.0 — validated in production with orphanRecoveries=0% after
+// the v3.4.4 fuzzy-id-lookup fix. Set CLAUDE_BRIDGE_PATH_D=0 to revert to
+// the legacy spawn-fresh path if needed. The plumbing always starts (MCP
+// server + session pool); cli-worker.ts only routes to them when the flag
+// is true (which it now is unless explicitly disabled).
+const pathDEnabled = !/^(0|false|no|off)$/i.test(
+  process.env.CLAUDE_BRIDGE_PATH_D ?? "1",
 );
 const pathDPort = parseInt(process.env.CLAUDE_BRIDGE_MCP_PORT ?? "0", 10);
 
