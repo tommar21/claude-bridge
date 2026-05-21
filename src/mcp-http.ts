@@ -266,7 +266,23 @@ export class BridgeMcpHttpServer {
    *  during normal flow under `--max-turns 1`, so the linear scan is fine.
    *  On ambiguous matches (extremely unlikely for native anthropic ids), we
    *  prefer the most recently-added pending (highest seq) and log a warning
-   *  so the operator can investigate. */
+   *  so the operator can investigate.
+   *
+   *  HISTORICAL CONTEXT (PR #13, v3.4.4): without this fuzzy fallback the
+   *  bridge would miss every matrix-originated tool_result lookup, trigger
+   *  unregisterSession (SIGTERM the CLI), and orphan-respawn the session.
+   *  Production orphanRecoveries ran at ~55% before this. After: 0%.
+   *
+   *  WHY WE DIDN'T FIX IT UPSTREAM IN MATRIX: the architecturally "clean"
+   *  fix is `preserveNativeAnthropicToolUseIds: true` on the matrix-side
+   *  claude-bridge provider plugin. That would require either creating a
+   *  bundled extension in matrix's `extensions/claude-bridge/` (5-6 files
+   *  of boilerplate for one config flag) or extending matrix's user-config
+   *  schema to allow per-provider transcript-policy overrides (touches
+   *  core config-public-surface). The bridge fuzzy lookup costs ~10 LOC
+   *  AND protects against any future OAI-compatible client that sanitizes
+   *  ids the same way, so it's strictly better than the matrix-side path.
+   *  Keep this defensive even if matrix ever adds the upstream opt-in. */
   private findPending(
     ctx: SessionContext,
     lookupId: string,
