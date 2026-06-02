@@ -20,6 +20,25 @@ const MCP_SERVER_NAME = "openclaw";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MCP_SERVER_SCRIPT = path.resolve(__dirname, "./mcp-server.js");
 
+/**
+ * System-reminder appended to the system prompt when the caller sets
+ * X-Bridge-Ultracode: 1. Nudges the model to default to spawning parallel
+ * subagents for substantive work — the bridge-side mirror of Claude.ai's
+ * "ultracode mode". Kept generic so it applies to any tool surface the
+ * model has (Task/Agent/Workflow). Don't enable this for scripted cron
+ * agents that already know their plan; use only for "investigate heavy"
+ * style turns where token-cost-vs-completeness should tilt to completeness.
+ */
+const ULTRACODE_REMINDER = `<system-reminder>
+Ultracode mode is on. For any substantive task (research, analysis, multi-file edits, audits):
+- Default to spawning parallel subagents when work can be decomposed
+- Prioritize completeness and verification over token cost
+- For multi-phase work, run discovery → design → implement → review in sequence; verify between phases
+- Solo only on conversational turns or trivial mechanical edits
+
+This reminder is sticky for the conversation.
+</system-reminder>`;
+
 export interface ToolDefinition {
   name: string;
   description?: string;
@@ -33,6 +52,15 @@ export interface CLIRequest {
   systemPrompt?: string;
   tools: ToolDefinition[];
   sessionKey?: string;
+  /** Optional CLI --effort passthrough. Allowed values: low|medium|high|xhigh|max.
+   *  When omitted, the CLI uses its built-in default (currently medium). Higher
+   *  effort = more thinking tokens = slower + costlier but better reasoning. */
+  effort?: string;
+  /** When true: force --effort xhigh AND append an ultracode system-reminder
+   *  to the system prompt nudging the model to default to spawning parallel
+   *  subagents for substantive work. Use for "investigate heavy" style turns;
+   *  do NOT use for scripted cron agents that already know their plan. */
+  ultracode?: boolean;
 }
 
 export interface CLIToolCall {
@@ -49,6 +77,13 @@ export interface CLIResult {
   stopReason: string;
   sessionId: string;
   rateLimitStatus: string | undefined;
+  /** Resolved model version (e.g. "claude-opus-4-5-20251201") that the
+   *  upstream CLI reported in its stream. Differs from `request.model`
+   *  (a short alias like "opus") and from the OpenAI-shape `model` field
+   *  in the response (which echoes the requested id like "claude-opus-4").
+   *  `undefined` when the stream finished without emitting an assistant
+   *  event (error before content, immediate tool_use, etc). */
+  modelVersion: string | undefined;
 }
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -105,17 +140,28 @@ export interface PersistentCLIRequest {
   /** XML-encoded full history. Used only when the persistent session is
    *  fresh. Sent as the first user message INSTEAD of lastUserContent. */
   primingPrompt: string | undefined;
+  /** See CLIRequest.effort. */
+  effort?: string;
+  /** See CLIRequest.ultracode. */
+  ultracode?: boolean;
 }
 
 function fingerprint(spec: {
   model: string;
   tools: McpTool[];
   systemPrompt: string | undefined;
+  effort?: string;
 }): string {
   const hash = createHash("sha256");
   hash.update(spec.model);
   hash.update("\0");
   hash.update(spec.systemPrompt ?? "");
+  hash.update("\0");
+  // Include effort so a request that changes effort mid-session triggers a
+  // respawn. The CLI accepts --effort only at startup; reusing a session
+  // started with --effort medium and ignoring a later xhigh request would
+  // silently lose the requested behavior.
+  hash.update(spec.effort ?? "");
   hash.update("\0");
   const sortedTools = [...spec.tools].sort((a, b) => a.name.localeCompare(b.name));
   for (const t of sortedTools) {
@@ -150,12 +196,29 @@ export async function enqueuePersistent(
     metrics.totalRequests++;
     const startedAt = Date.now();
     try {
-      const spec_fp = fingerprint(request);
+      // Resolve effort + ultracode. Ultracode overrides effort (forces xhigh)
+      // and appends the ultracode reminder to the system prompt. Both are
+      // baked into the spec fingerprint so a request that changes either
+      // triggers a fresh session — the CLI accepts --effort + --system-prompt
+      // only at startup.
+      const effectiveEffort = request.ultracode
+        ? "xhigh"
+        : request.effort;
+      const effectiveSystemPrompt = request.ultracode
+        ? `${request.systemPrompt ?? ""}\n\n${ULTRACODE_REMINDER}`.trim()
+        : request.systemPrompt;
+      const spec_fp = fingerprint({
+        model: request.model,
+        tools: request.tools,
+        systemPrompt: effectiveSystemPrompt,
+        effort: effectiveEffort,
+      });
       const acquireSpec = {
         model: request.model,
         tools: request.tools,
-        systemPrompt: request.systemPrompt,
+        systemPrompt: effectiveSystemPrompt,
         spec_fp,
+        effort: effectiveEffort,
       };
       const acquired = sessionPool.acquire(request.sessionKey, acquireSpec);
       let session = acquired.session;
@@ -282,6 +345,7 @@ export async function enqueuePersistent(
         stopReason,
         sessionId: session.sessionId,
         rateLimitStatus: cp.result?.rateLimitStatus,
+        modelVersion: cp.result?.modelVersion,
       };
     } catch (err) {
       metrics.failures++;
@@ -527,6 +591,17 @@ async function runCLI(
   const { sessionId, isNew } = getOrCreateSessionId(request.sessionKey);
   const hasTools = request.tools.length > 0;
 
+  // Resolve effort + ultracode the same way Path D does. Ultracode forces
+  // xhigh effort and appends the ultracode reminder to the system prompt.
+  // For the legacy path the system prompt augmentation only matters on a
+  // fresh session — once resumed, --system-prompt is ignored by the CLI.
+  const effectiveEffort = request.ultracode ? "xhigh" : request.effort;
+  const effectiveSystemPrompt = request.ultracode && request.systemPrompt !== undefined
+    ? `${request.systemPrompt}\n\n${ULTRACODE_REMINDER}`.trim()
+    : request.ultracode
+      ? ULTRACODE_REMINDER
+      : request.systemPrompt;
+
   const args = [
     "--print",
     "--output-format",
@@ -540,6 +615,9 @@ async function runCLI(
     "",
     "--strict-mcp-config",
   ];
+  if (effectiveEffort) {
+    args.push("--effort", effectiveEffort);
+  }
 
   let mcpCleanup: (() => void) | undefined;
   if (hasTools) {
@@ -552,8 +630,8 @@ async function runCLI(
 
   if (isNew) {
     args.push("--session-id", sessionId);
-    if (request.systemPrompt) {
-      args.push("--system-prompt", request.systemPrompt);
+    if (effectiveSystemPrompt) {
+      args.push("--system-prompt", effectiveSystemPrompt);
     }
   } else {
     args.push("--resume", sessionId);
@@ -654,11 +732,88 @@ async function runCLI(
       stopReason,
       sessionId,
       rateLimitStatus: parsed.rateLimitStatus,
+      modelVersion: parsed.modelVersion,
     };
   } finally {
     clearTimeout(timer);
     mcpCleanup?.();
   }
+}
+
+// ─── Rate-limit tracker ─────────────────────────────────────────────────────
+// Latest rate_limit_event seen from any in-flight session. Surfaces via
+// getMetrics() so the UI can warn the user before they fire a costly
+// cron. Captures the raw status string ("standard", "warning", "approaching",
+// "exhausted") + when it landed, so callers can age out stale data.
+
+let latestRateLimit: { status: string; updatedAtMs: number } | null = null;
+
+/**
+ * Record a rate_limit_event status from a finished CLI worker. Called by
+ * the session-pool path after each model invocation that streamed one.
+ * Safe to call with `undefined` — those are ignored so the previous good
+ * status sticks until something fresher arrives.
+ */
+export function recordRateLimitStatus(status: string | undefined): void {
+  if (!status) return;
+  latestRateLimit = { status, updatedAtMs: Date.now() };
+}
+
+export function getLatestRateLimit(): {
+  status: string;
+  updatedAtMs: number;
+  ageMs: number;
+} | null {
+  if (!latestRateLimit) return null;
+  return {
+    status: latestRateLimit.status,
+    updatedAtMs: latestRateLimit.updatedAtMs,
+    ageMs: Date.now() - latestRateLimit.updatedAtMs,
+  };
+}
+
+// ─── Resolved model version tracker ─────────────────────────────────────────
+// For each model slug we serve (claude-opus-4, claude-sonnet-4, claude-haiku-4),
+// remember the latest resolved upstream version we've seen in any assistant
+// event. Surfaces via getMetrics() so the UI / monitoring can show "opus is
+// currently serving 4-5-20251201 (last seen 2m ago)" — useful for catching
+// silent upstream version flips that change behavior under a stable slug.
+
+const latestResolvedModels = new Map<
+  string,
+  { version: string; updatedAtMs: number }
+>();
+
+/**
+ * Record the resolved model version reported by the CLI on its assistant
+ * event for a request that asked for `slug`. Safe to call with `undefined`
+ * version — those are ignored so the last good entry sticks.
+ */
+export function recordResolvedModel(
+  slug: string,
+  version: string | undefined,
+): void {
+  if (!version) return;
+  latestResolvedModels.set(slug, { version, updatedAtMs: Date.now() });
+}
+
+export function getResolvedModels(): Record<
+  string,
+  { version: string; updatedAtMs: number; ageMs: number }
+> {
+  const out: Record<
+    string,
+    { version: string; updatedAtMs: number; ageMs: number }
+  > = {};
+  const now = Date.now();
+  for (const [slug, entry] of latestResolvedModels) {
+    out[slug] = {
+      version: entry.version,
+      updatedAtMs: entry.updatedAtMs,
+      ageMs: now - entry.updatedAtMs,
+    };
+  }
+  return out;
 }
 
 async function collectStream(
@@ -705,6 +860,14 @@ export interface BridgeMetrics {
   activeProcesses: number;
   sessions: number;
   sessionTails: number;
+  rateLimit: { status: string; updatedAtMs: number; ageMs: number } | null;
+  /** Latest upstream-resolved model version per slug we've served. Useful
+   *  for spotting silent upstream version flips (e.g. opus alias starts
+   *  resolving to a newer model with different behavior). */
+  resolvedModels: Record<
+    string,
+    { version: string; updatedAtMs: number; ageMs: number }
+  >;
 }
 
 export function getMetrics(): BridgeMetrics {
@@ -724,6 +887,13 @@ export function getMetrics(): BridgeMetrics {
     activeProcesses: activeProcs.size,
     sessions: sessions.size,
     sessionTails: sessionTail.size,
+    // Surface the most recent rate_limit_event status the upstream
+    // Anthropic API sent us. `null` until we've seen at least one
+    // streaming response (i.e. immediately after bridge boot).
+    rateLimit: getLatestRateLimit(),
+    // Latest upstream-resolved model version per slug we've served.
+    // Empty until we've seen at least one assistant event for each slug.
+    resolvedModels: getResolvedModels(),
   };
 }
 

@@ -45,6 +45,10 @@ export interface SessionSpec {
   /** Fingerprint used to decide whether an existing session is reusable.
    *  Caller builds this — typically sha256(sortedTools + systemPrompt). */
   spec_fp: string;
+  /** Optional CLI --effort passthrough (low|medium|high|xhigh|max). Forms
+   *  part of the spec_fp so changing effort between requests triggers a
+   *  respawn — the CLI accepts --effort only at startup. */
+  effort?: string;
 }
 
 export interface TurnCheckpoint {
@@ -60,6 +64,10 @@ export interface TurnCheckpoint {
     inputTokens: number;
     outputTokens: number;
     rateLimitStatus: string | undefined;
+    /** Resolved upstream model version (e.g. "claude-opus-4-5-20251201") as
+     *  reported in the assistant event's `model` field. May be `undefined`
+     *  if the turn ended before an assistant event arrived. */
+    modelVersion: string | undefined;
     isError: boolean;
     errorMessage: string | undefined;
   } | null;
@@ -228,6 +236,7 @@ class PersistentSession {
             inputTokens: 0,
             outputTokens: 0,
             rateLimitStatus: undefined,
+            modelVersion: undefined,
             isError: true,
             errorMessage: "CLI stream closed unexpectedly",
           },
@@ -315,6 +324,7 @@ class PersistentSession {
     let outputTokens = 0;
     let inputTokens = 0;
     let rateLimitStatus: string | undefined;
+    let modelVersion: string | undefined;
     for await (const line of lines) {
       if (!line.trim()) continue;
       let evt: Record<string, unknown>;
@@ -338,7 +348,11 @@ class PersistentSession {
       // capture for the continuation HTTP response.
       if (type === "assistant") {
         const message = evt.message as
-          | { content?: Array<Record<string, unknown>>; usage?: { input_tokens?: number; output_tokens?: number } }
+          | {
+              content?: Array<Record<string, unknown>>;
+              usage?: { input_tokens?: number; output_tokens?: number };
+              model?: string;
+            }
           | undefined;
         for (const block of message?.content ?? []) {
           if (block.type === "text" && typeof block.text === "string") {
@@ -358,6 +372,12 @@ class PersistentSession {
               },
             });
           }
+        }
+        // Capture resolved model version on the first assistant event we see
+        // in this turn. Subsequent assistant events on the same turn carry
+        // the same model — first-wins is fine.
+        if (!modelVersion && typeof message?.model === "string") {
+          modelVersion = message.model;
         }
         const usage = message?.usage;
         if (usage) {
@@ -388,14 +408,17 @@ class PersistentSession {
             inputTokens,
             outputTokens,
             rateLimitStatus,
+            modelVersion,
             isError,
             errorMessage,
           },
         });
-        // Reset per-turn token + rate-limit state for the next user message.
+        // Reset per-turn token + rate-limit + model-version state for the
+        // next user message in this persistent session.
         outputTokens = 0;
         inputTokens = 0;
         rateLimitStatus = undefined;
+        modelVersion = undefined;
       }
     }
     this.mark("stream:closed");
@@ -541,6 +564,7 @@ export class PersistentSessionPool {
     ];
     if (spec.systemPrompt) args.push("--system-prompt", spec.systemPrompt);
     if (allowedTools) args.push("--allowedTools", allowedTools);
+    if (spec.effort) args.push("--effort", spec.effort);
 
     const proc = spawn("claude", args, {
       env: { ...process.env },

@@ -20,6 +20,15 @@ export interface StreamResult {
   outputTokens: number;
   stopReason: string;
   rateLimitStatus: string | undefined;
+  /**
+   * The model version the upstream actually resolved + used, as reported
+   * by the Claude CLI in its assistant message envelope. Caller passes
+   * `--model opus` (alias), upstream resolves to e.g. `claude-opus-4-5-20251201`.
+   * Surface this so the UI / metrics can show which concrete version each
+   * cron run actually hit (useful when Anthropic ships a new variant
+   * silently under the same alias).
+   */
+  modelVersion: string | undefined;
   isError: boolean;
   errorMessage: string | undefined;
 }
@@ -38,6 +47,9 @@ interface StreamEvent {
     content?: AssistantContentBlock[];
     usage?: { input_tokens?: number; output_tokens?: number };
     stop_reason?: string | null;
+    /** Resolved model version (e.g. "claude-opus-4-5-20251201") — present
+     *  on assistant events from the Claude CLI's stream-json output. */
+    model?: string;
   };
   rate_limit_info?: { status?: string };
   subtype?: string;
@@ -85,6 +97,7 @@ export async function parseStream(
   let outputTokens = 0;
   let stopReason = "end_turn";
   let rateLimitStatus: string | undefined;
+  let modelVersion: string | undefined;
   let isError = false;
   let errorMessage: string | undefined;
   let sawUserInjection = false;
@@ -118,6 +131,12 @@ export async function parseStream(
           toolUses.push(tu);
           handlers?.onToolUse?.(tu);
         }
+      }
+      // Capture the resolved model version on the first assistant event
+      // we see. Subsequent events on the same turn carry the same model,
+      // so only-first is fine; we don't need to re-set on every chunk.
+      if (!modelVersion && typeof evt.message?.model === "string") {
+        modelVersion = evt.message.model;
       }
       const usage = evt.message?.usage;
       if (usage) {
@@ -162,6 +181,7 @@ export async function parseStream(
     outputTokens,
     stopReason,
     rateLimitStatus,
+    modelVersion,
     isError,
     errorMessage,
   };

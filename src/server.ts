@@ -10,13 +10,15 @@ import {
   enqueueRequest,
   getMetrics,
   isPathDEnabled,
+  recordRateLimitStatus,
+  recordResolvedModel,
   type CLIResult,
   type CLIToolCall,
 } from "./cli-worker.js";
 import type { OAIChatRequest } from "./translate.js";
 import { buildPrompt, extractForPathD, toolsFromRequest } from "./translate.js";
 
-export const BRIDGE_VERSION = "3.5.0";
+export const BRIDGE_VERSION = "3.6.0";
 
 // Flipped to true on SIGTERM/SIGINT so new chat-completion requests get
 // rejected with 503 while we drain. Health + models stay up for LB checks.
@@ -186,6 +188,22 @@ async function handleChatCompletions(
   const tools = toolsFromRequest(oaiReq);
   const startTime = Date.now();
 
+  // Bridge-specific request hints exposed as headers. Headers (not body
+  // fields) so they pass cleanly through clients that don't know to extend
+  // the OpenAI request shape (Hermes Agent, openclaw matrix gateway, etc).
+  //   X-Bridge-Effort: low|medium|high|xhigh|max — CLI --effort passthrough
+  //   X-Bridge-Ultracode: 1 — force xhigh + inject ultracode reminder
+  const effortHeader = req.headers["x-bridge-effort"];
+  const requestedEffort = typeof effortHeader === "string"
+    ? effortHeader.toLowerCase()
+    : undefined;
+  const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+  const effort = requestedEffort && VALID_EFFORTS.has(requestedEffort)
+    ? requestedEffort
+    : undefined;
+  const ultracodeHeader = req.headers["x-bridge-ultracode"];
+  const ultracode = ultracodeHeader === "1" || ultracodeHeader === "true";
+
   log("info", "Request", {
     model: model.id,
     cliModel: model.cliAlias,
@@ -193,6 +211,8 @@ async function handleChatCompletions(
     messages: oaiReq.messages.length,
     tools: tools.length,
     hasSystemPrompt: !!built.systemPrompt,
+    effort,
+    ultracode,
   });
 
   const lastUserMsg = oaiReq.messages.filter((m) => m.role === "user").pop();
@@ -214,6 +234,8 @@ async function handleChatCompletions(
     systemPrompt: built.systemPrompt,
     tools,
     sessionKey: oaiReq.user,
+    effort,
+    ultracode,
   };
 
   // Route to Path D (persistent CLI + in-bridge MCP) when:
@@ -233,6 +255,8 @@ async function handleChatCompletions(
       lastUserContent: pathD.lastUserContent,
       pendingToolResult: pathD.pendingToolResult,
       primingPrompt: pathD.primingPrompt,
+      effort,
+      ultracode,
     };
     if (oaiReq.stream) {
       await handlePersistentStreaming(req, res, persistentReq, model.id, startTime);
@@ -257,6 +281,8 @@ async function handlePersistentNonStreaming(
 ): Promise<void> {
   try {
     const result = await enqueuePersistent(req);
+    recordRateLimitStatus(result.rateLimitStatus);
+    recordResolvedModel(modelId, result.modelVersion);
     const duration = Date.now() - startTime;
     log("info", "Response", {
       model: modelId,
@@ -353,6 +379,8 @@ async function handlePersistentStreaming(
       },
     });
 
+    recordRateLimitStatus(result.rateLimitStatus);
+    recordResolvedModel(modelId, result.modelVersion);
     const duration = Date.now() - startTime;
     log("info", "Response", {
       model: modelId,
@@ -406,6 +434,8 @@ async function handleNonStreaming(
 ): Promise<void> {
   try {
     const result = await enqueueRequest(cliReq);
+    recordRateLimitStatus(result.rateLimitStatus);
+    recordResolvedModel(modelId, result.modelVersion);
     const duration = Date.now() - startTime;
     log("info", "Response", {
       model: modelId,
@@ -516,6 +546,8 @@ async function handleStreaming(
       },
     });
 
+    recordRateLimitStatus(result.rateLimitStatus);
+    recordResolvedModel(modelId, result.modelVersion);
     const duration = Date.now() - startTime;
     log("info", "Response", {
       model: modelId,
