@@ -1,6 +1,6 @@
 {
   "name": "@parallact/claude-bridge",
-  "version": "3.6.0",
+  "version": "3.6.1",
   "description": "OpenAI-compatible proxy for Claude, backed by a Claude CLI worker pool with MCP-based structured tool calling. Supports Claude Max OAuth tokens.",
   "type": "module",
   "main": "dist/index.js",

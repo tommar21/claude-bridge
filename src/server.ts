@@ -18,7 +18,7 @@ import {
 import type { OAIChatRequest } from "./translate.js";
 import { buildPrompt, extractForPathD, toolsFromRequest } from "./translate.js";
 
-export const BRIDGE_VERSION = "3.6.0";
+export const BRIDGE_VERSION = "3.6.1";
 
 // Flipped to true on SIGTERM/SIGINT so new chat-completion requests get
 // rejected with 503 while we drain. Health + models stay up for LB checks.
