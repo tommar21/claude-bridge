@@ -6,6 +6,11 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { debugLog, hashString, newRequestId } from "./debug-logger.js";
+import {
+  couldBeErrorAsContent,
+  ERROR_SNIFF_CHARS,
+  isErrorAsContent,
+} from "./error-as-content.js";
 import type { BridgeMcpHttpServer, McpTool } from "./mcp-http.js";
 import type { PersistentSessionPool } from "./session-pool.js";
 import type { ContentBlock } from "./translate.js";
@@ -173,6 +178,66 @@ function fingerprint(spec: {
   return hash.digest("hex");
 }
 
+/** Wrap stream handlers so the leading assistant text is buffered until we
+ *  know it is NOT a CLI error-as-content line ("API Error: 400 ..."). If it
+ *  IS one, the text is swallowed entirely: the caller's SSE stream stays
+ *  uncommitted, the turn-level check throws, and retries / clean JSON 500s
+ *  remain possible. Without this gate the error text streams out as normal
+ *  deltas and poisons the response before we can classify it. */
+function gateErrorAsContent(handlers: StreamEventHandlers | undefined): {
+  handlers: StreamEventHandlers | undefined;
+  /** Flush a held non-error prefix at end of turn (short replies). */
+  finalize: () => void;
+} {
+  if (!handlers) return { handlers: undefined, finalize: () => {} };
+  let buffer = "";
+  let decided = false;
+  let suppressed = false;
+  const flushBuffer = () => {
+    if (buffer) {
+      handlers.onTextDelta?.(buffer);
+      buffer = "";
+    }
+  };
+  return {
+    handlers: {
+      onTextDelta: (d) => {
+        if (suppressed) return; // swallow the rest of the error line
+        if (decided) {
+          handlers.onTextDelta?.(d);
+          return;
+        }
+        buffer += d;
+        if (couldBeErrorAsContent(buffer)) {
+          if (buffer.length >= ERROR_SNIFF_CHARS && isErrorAsContent(buffer)) {
+            suppressed = true;
+            decided = true;
+            buffer = "";
+          }
+          // else: still an ambiguous prefix — keep buffering.
+          return;
+        }
+        decided = true;
+        flushBuffer();
+      },
+      onToolUse: (t) => {
+        // A tool_use means this is a real completion; release held text.
+        if (!decided) {
+          decided = true;
+          flushBuffer();
+        }
+        handlers.onToolUse?.(t);
+      },
+    },
+    finalize: () => {
+      if (!decided && !isErrorAsContent(buffer)) {
+        decided = true;
+        flushBuffer();
+      }
+    },
+  };
+}
+
 /** Path D entry point. Either sends a fresh user message on a reused
  *  session, or delivers a tool_result to a previously-captured tool_use
  *  and continues reading events. Returns once the CLI emits tool_use
@@ -292,7 +357,9 @@ export async function enqueuePersistent(
         session.sendUserMessage(request.lastUserContent);
       }
 
-      const cp = await session.nextCheckpoint(handlers, poolConfig.timeoutMs);
+      const gate = gateErrorAsContent(handlers);
+      const cp = await session.nextCheckpoint(gate.handlers, poolConfig.timeoutMs);
+      gate.finalize();
 
       // If the stream gave us a tool_use, block briefly until the MCP
       // HTTP POST for it lands in the bridge's pending map. The two
@@ -320,6 +387,15 @@ export async function enqueuePersistent(
         toolCalls.length > 0 ? "tool_use" : cp.result?.stopReason ?? "end_turn";
       if (cp.result?.isError && toolCalls.length === 0 && !cp.text) {
         throw new Error(`CLI error: ${cp.result.errorMessage ?? "unknown"}`);
+      }
+      // CLI printed an upstream API failure as assistant text (e.g.
+      // "API Error: 400 ... out of extra usage"). Surface it as a real
+      // error so callers retry/fallback instead of delivering the error
+      // line as a chat reply. Tear the session down: its in-CLI history
+      // now contains the failed turn and is not safely reusable.
+      if (toolCalls.length === 0 && isErrorAsContent(cp.text)) {
+        sessionPool.teardown(request.sessionKey);
+        throw new Error(`CLI error-as-content: ${cp.text.slice(0, 300)}`);
       }
 
       metrics.successes++;
@@ -503,6 +579,9 @@ const TRANSIENT_PATTERNS = [
   /\b5\d{2}\b/, // 500-599 upstream
   /rate.?limit/i,
   /overloaded/i,
+  // claude.ai Max quota exhaustion surfaced by the CLI as content; proven
+  // to recover within seconds (rolling-window quota), so worth retrying.
+  /out of extra usage/i,
 ];
 
 function isTransient(err: unknown): boolean {
@@ -515,7 +594,10 @@ async function runCLIWithRetry(
   handlers?: StreamEventHandlers,
 ): Promise<CLIResult> {
   const maxAttempts = 3;
-  const backoffMs = [500, 1500]; // wait before attempt 2, 3
+  // Observed quota windows ("out of extra usage") last seconds to ~2min;
+  // 0.5s/1.5s retries all landed inside the same bad window. 2s/8s still
+  // bounds added latency at ~10s worst-case while clearing short windows.
+  const backoffMs = [2000, 8000]; // wait before attempt 2, 3
   let lastErr: unknown;
   // If we've already streamed any bytes to the caller, a retry would emit a
   // second leading assistant turn into the same SSE stream — confusing for
@@ -682,13 +764,15 @@ async function runCLI(
   }, poolConfig.timeoutMs);
 
   try {
+    const gate = gateErrorAsContent(handlers);
     const [parsed, exitCode, stderrText] = await Promise.all([
-      parseStream(linesOf(proc.stdout!), handlers),
+      parseStream(linesOf(proc.stdout!), gate.handlers),
       new Promise<number | null>((resolve) =>
         proc.on("close", (code) => resolve(code)),
       ),
       collectStream(proc.stderr!),
     ]);
+    gate.finalize();
 
     if (timedOut) {
       throw new Error(`CLI timeout after ${poolConfig.timeoutMs}ms`);
@@ -703,6 +787,15 @@ async function runCLI(
       const stderrHint = stderrText.slice(0, 300);
       if (request.sessionKey) sessions.delete(request.sessionKey);
       throw new Error(`CLI error: ${hint}${stderrHint ? ` | stderr: ${stderrHint}` : ""}`);
+    }
+
+    // Upstream API failure printed as assistant text by the CLI (the
+    // out-of-extra-usage / overloaded class). Throw so runCLIWithRetry can
+    // retry it as transient; the streaming gate above guarantees nothing
+    // was forwarded to the caller, so a retry emits a clean fresh turn.
+    if (toolCalls.length === 0 && isErrorAsContent(parsed.text)) {
+      if (request.sessionKey) sessions.delete(request.sessionKey);
+      throw new Error(`CLI error-as-content: ${parsed.text.slice(0, 300)}`);
     }
 
     if (exitCode !== 0 && toolCalls.length === 0 && !parsed.text) {
