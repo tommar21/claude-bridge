@@ -33,9 +33,7 @@ import { randomUUID } from "node:crypto";
 import type { BridgeMcpHttpServer, CapturedToolUse, McpTool } from "./mcp-http.js";
 import { linesOf, parseStream, type StreamEventHandlers } from "./stream-parser.js";
 import { formatUserMessageLine } from "./user-message-format.js";
-export { formatUserMessageLine } from "./user-message-format.js";
 import type { ContentBlock } from "./translate.js";
-export type { ContentBlock } from "./translate.js";
 import { decideSessionAction } from "./session-pool-decision.js";
 
 export interface SessionSpec {
@@ -279,10 +277,6 @@ class PersistentSession {
     }, 2000).unref();
   }
 
-  get mcpEndpoint(): string {
-    return this.mcpUrl;
-  }
-
   // ─── Internals ────────────────────────────────────────────────────────
 
   private readOne(timeoutMs: number): Promise<TurnEvent | null> {
@@ -498,22 +492,6 @@ export class PersistentSessionPool {
     this.sessions.delete(sessionKey);
   }
 
-  size(): number {
-    return this.sessions.size;
-  }
-
-  stats(): { total: number; oldestAgeMs: number | null; idleAgeMs: number | null } {
-    if (this.sessions.size === 0) return { total: 0, oldestAgeMs: null, idleAgeMs: null };
-    const now = Date.now();
-    let oldest = 0;
-    let idle = 0;
-    for (const s of this.sessions.values()) {
-      oldest = Math.max(oldest, now - s.createdAt);
-      idle = Math.max(idle, now - s.lastUsed);
-    }
-    return { total: this.sessions.size, oldestAgeMs: oldest, idleAgeMs: idle };
-  }
-
   async shutdown(): Promise<void> {
     if (this.evictTimer) {
       clearInterval(this.evictTimer);
@@ -547,13 +525,17 @@ export class PersistentSessionPool {
       "--verbose",
       "--model",
       spec.model,
-      // Conservative cap per message: the persistent-CLI flow is one
-      // user message → one tool_use round (blocks on MCP) → continuation →
-      // final text. If the model chains multiple tools within a single turn
-      // we bump this, but the bridge normally returns each tool_use to the
-      // external caller so the caller drives the chain.
+      // Cap per message: the persistent-CLI flow is normally one user message →
+      // one tool_use round (blocks on MCP) → continuation → final text. But
+      // multi-step crons (juan-upwork, *-self-maintenance) legitimately chain
+      // more tool calls within a single bridge message and were hitting
+      // "Reached maximum number of turns (8)" → the gateway saw a FailoverError
+      // timeout (the retry usually succeeded → flaky). Raised to 16 (env-tunable)
+      // to absorb them; the CLI still terminates on end_turn and the v3.6.1
+      // timeout/teardown safety still bounds runaway sessions. Local bridge
+      // patch — re-apply after a bridge update.
       "--max-turns",
-      "8",
+      String(Number(process.env.CLAUDE_BRIDGE_PATHD_MAX_TURNS) || 16),
       "--tools",
       "",
       "--mcp-config",
