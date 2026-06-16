@@ -47,15 +47,6 @@ test("tryResolveToolCall: returns false when pending entry missing", () => {
   assert.equal(ok, false);
 });
 
-test("resolveToolCall: still throws when pending missing (backward compat)", () => {
-  const server = new BridgeMcpHttpServer();
-  server.registerSession("s1", []);
-  assert.throws(
-    () => server.resolveToolCall("s1", "toolu_x", "result"),
-    /no pending tool call: toolu_x/,
-  );
-});
-
 test("tryResolveToolCall: returns true on successful resolve, deletes pending", () => {
   const server = new BridgeMcpHttpServer();
   server.registerSession("s1", []);

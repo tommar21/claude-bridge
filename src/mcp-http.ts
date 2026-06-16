@@ -7,7 +7,7 @@
  * request here. Instead of running the tool locally, this server PARKS the
  * request (holds the HTTP response open) until the bridge's OpenAI-side
  * handler gets a real tool_result from the external caller (OpenClaw
- * runtime) and resolves it via `resolveToolCall`. The CLI then unblocks,
+ * runtime) and resolves it via `tryResolveToolCall`. The CLI then unblocks,
  * the model sees the real result, and the conversation continues — with a
  * clean session transcript, no permission-denied artifacts.
  *
@@ -23,16 +23,6 @@ export interface McpTool {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
-}
-
-export interface CapturedToolUse {
-  /** Bridge-internal correlation id, matches the tool_use block id in the
-   *  CLI's stream-json output (_meta.claudecode/toolUseId on the MCP side). */
-  toolUseId: string;
-  /** Tool name as seen by the model — already stripped of any mcp__ prefix. */
-  name: string;
-  /** Tool arguments, parsed from JSON-RPC params.arguments. */
-  args: Record<string, unknown>;
 }
 
 interface PendingCall {
@@ -56,20 +46,22 @@ interface PendingCall {
 
 let pendingSeq = 0;
 
-interface ToolCallWaiter {
-  resolve: (call: CapturedToolUse) => void;
-  reject: (err: Error) => void;
+/** A tool_use captured from the CLI's stream-json output, consumed by the
+ *  PathD session pool to drive the tool-result round-trip. */
+export interface CapturedToolUse {
+  /** Bridge-internal correlation id, matches the tool_use block id in the
+   *  CLI's stream-json output (_meta.claudecode/toolUseId on the MCP side). */
+  toolUseId: string;
+  /** Tool name as seen by the model — already stripped of any mcp__ prefix. */
+  name: string;
+  /** Tool arguments, parsed from JSON-RPC params.arguments. */
+  args: Record<string, unknown>;
 }
 
 interface SessionContext {
   sessionKey: string;
   tools: McpTool[];
   pending: Map<string, PendingCall>;
-  /** When the bridge's main flow is waiting for the NEXT tool_use the model
-   *  emits. If a tools/call arrives and a waiter exists, the waiter resolves
-   *  synchronously and the pending entry is still stored so a later
-   *  resolveToolCall can respond to the CLI. */
-  waiters: ToolCallWaiter[];
 }
 
 const JSON_RPC_INVALID = -32600;
@@ -100,10 +92,8 @@ export class BridgeMcpHttpServer {
   }
 
   async stop(): Promise<void> {
-    // Fail all waiters + in-flight pending responses so no consumer hangs.
+    // Fail all in-flight pending responses so no consumer hangs.
     for (const ctx of this.sessions.values()) {
-      for (const w of ctx.waiters) w.reject(new Error("mcp server stopping"));
-      ctx.waiters.length = 0;
       for (const p of ctx.pending.values()) {
         if (!p.resolved) this.finishResponse(p, { error: { code: -32000, message: "server stopping" } });
       }
@@ -127,7 +117,7 @@ export class BridgeMcpHttpServer {
   registerSession(sessionKey: string, tools: McpTool[]): void {
     let ctx = this.sessions.get(sessionKey);
     if (!ctx) {
-      ctx = { sessionKey, tools, pending: new Map(), waiters: [] };
+      ctx = { sessionKey, tools, pending: new Map() };
       this.sessions.set(sessionKey, ctx);
     } else {
       ctx.tools = tools;
@@ -137,7 +127,6 @@ export class BridgeMcpHttpServer {
   unregisterSession(sessionKey: string): void {
     const ctx = this.sessions.get(sessionKey);
     if (!ctx) return;
-    for (const w of ctx.waiters) w.reject(new Error("session unregistered"));
     for (const p of ctx.pending.values()) {
       if (!p.resolved) {
         this.finishResponse(p, {
@@ -148,30 +137,12 @@ export class BridgeMcpHttpServer {
     this.sessions.delete(sessionKey);
   }
 
-  /** Wait for the CLI to emit the next tool_use for this session. Resolves
-   *  with the captured call. The HTTP response to the CLI stays parked
-   *  until resolveToolCall is invoked. */
-  awaitNextToolCall(sessionKey: string, timeoutMs = 300_000): Promise<CapturedToolUse> {
-    const ctx = this.sessions.get(sessionKey);
-    if (!ctx) return Promise.reject(new Error(`session not registered: ${sessionKey}`));
-    return new Promise<CapturedToolUse>((resolve, reject) => {
-      const waiter: ToolCallWaiter = { resolve, reject };
-      ctx.waiters.push(waiter);
-      const timer = setTimeout(() => {
-        const idx = ctx.waiters.indexOf(waiter);
-        if (idx !== -1) ctx.waiters.splice(idx, 1);
-        reject(new Error(`awaitNextToolCall timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-      timer.unref();
-    });
-  }
-
   /** Block briefly until the MCP POST for this tool_use_id lands in the
    *  pending map. The stream-json event that the bridge reads from the CLI
    *  can fire slightly before the MCP tools/call HTTP request arrives here,
    *  so the bridge needs to wait for this gate before returning the
    *  tool_use to the OAI caller — otherwise a fast caller round-trips with
-   *  a tool_result before pending exists and resolveToolCall throws. */
+   *  a tool_result before pending exists and tryResolveToolCall misses. */
   async waitForPending(sessionKey: string, toolUseId: string, timeoutMs = 10_000): Promise<void> {
     const ctx = this.sessions.get(sessionKey);
     if (!ctx) throw new Error(`session not registered: ${sessionKey}`);
@@ -185,14 +156,6 @@ export class BridgeMcpHttpServer {
       await new Promise((r) => setTimeout(r, 10));
     }
     throw new Error(`waitForPending timeout: ${toolUseId} did not arrive within ${timeoutMs}ms`);
-  }
-
-  /** Deliver a real tool_result to a previously-captured tool_use. Causes
-   *  the parked HTTP response to flush, unblocking the CLI. */
-  resolveToolCall(sessionKey: string, toolUseId: string, content: unknown): void {
-    if (!this.tryResolveToolCall(sessionKey, toolUseId, content)) {
-      throw new Error(`no pending tool call: ${toolUseId}`);
-    }
   }
 
   /** Try to deliver a tool_result. Returns true on success, false if the
@@ -239,21 +202,6 @@ export class BridgeMcpHttpServer {
     });
     ctx.pending.delete(key);
     return true;
-  }
-
-  /** Deliver an error result so the CLI sees the tool failed. */
-  rejectToolCall(sessionKey: string, toolUseId: string, message: string): void {
-    const ctx = this.sessions.get(sessionKey);
-    if (!ctx) throw new Error(`session not registered: ${sessionKey}`);
-    const match = this.findPending(ctx, toolUseId);
-    if (!match || match.pending.resolved) return;
-    this.finishResponse(match.pending, {
-      result: {
-        content: [{ type: "text", text: message }],
-        isError: true,
-      },
-    });
-    ctx.pending.delete(match.key);
   }
 
   /** Locate a pending entry by `toolUseId`. Tries exact match first; if that
@@ -499,14 +447,9 @@ export class BridgeMcpHttpServer {
       );
     });
 
-    const captured: CapturedToolUse = { toolUseId, name, args };
-    const waiter = ctx.waiters.shift();
-    if (waiter) {
-      waiter.resolve(captured);
-    }
-    // No waiter yet: the bridge's flow hasn't reached `awaitNextToolCall`
-    // yet. The pending entry stays until it's claimed + resolved. This is
-    // safe because --max-turns enforces one tool_use at a time per turn.
+    // The pending entry stays until it's claimed + resolved via the pending
+    // map (tryResolveToolCall). Safe because --max-turns enforces one
+    // tool_use at a time per turn.
   }
 
   // ─── Helpers ────────────────────────────────────────────────────────────
