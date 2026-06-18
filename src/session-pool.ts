@@ -149,6 +149,29 @@ class PersistentSession {
       });
     }
 
+    // A spawn failure (ENOENT) or a write-after-exit (EPIPE) emits an async
+    // 'error' event on the child / its stdin. With no listener Node escalates
+    // it to an uncaught exception that crashes the whole bridge. Treat it as a
+    // session death so the next acquire() respawns cleanly. On ENOENT 'close'
+    // may not fire, so mark dead + unblock any pending read here too.
+    this.proc.on("error", (err) => {
+      this.mark(`proc:error(${err instanceof Error ? err.message : String(err)})`);
+      if (!this._dead) {
+        this._dead = true;
+        if (this.pendingRead) {
+          const cb = this.pendingRead;
+          this.pendingRead = null;
+          cb(null);
+        }
+      }
+    });
+    if (this.proc.stdin) {
+      this.proc.stdin.on("error", () => {
+        // EPIPE when the CLI exits before reading stdin. Death is detected via
+        // 'close'/'error' above; swallow so the stream error isn't unhandled.
+      });
+    }
+
     this.proc.once("close", (code, signal) => {
       this._dead = true;
       const lifetimeMs = Date.now() - this.createdAt;
@@ -569,8 +592,14 @@ export class PersistentSessionPool {
     const now = Date.now();
     for (const [key, s] of this.sessions) {
       const idleFor = now - s.lastUsed;
-      const ageFor = now - s.createdAt;
-      if (s.dead || idleFor > this.config.idleEvictMs || ageFor > this.config.maxLifetimeMs) {
+      // Only reap dead or genuinely idle sessions here. Lifetime-based respawn
+      // (maxLifetimeMs) is enforced safely at acquire() time via
+      // decideSessionAction, INSIDE the per-session serialization lock. Doing
+      // it in this background sweep — which runs outside that lock — could
+      // SIGTERM a session mid-turn. Idle eviction is safe because idleEvictMs
+      // (10 min default) exceeds the per-turn timeout (5 min), so an in-flight
+      // turn always keeps lastUsed fresh enough to never look idle.
+      if (s.dead || idleFor > this.config.idleEvictMs) {
         this.teardown(key);
       }
     }

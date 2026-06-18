@@ -9,6 +9,7 @@
  */
 
 import * as fs from "node:fs";
+import { BRIDGE_VERSION } from "./version.js";
 
 interface McpTool {
   name: string;
@@ -76,7 +77,7 @@ function handle(msg: JsonRpcMessage): void {
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "claude-bridge", version: "3.3.0" },
+        serverInfo: { name: "claude-bridge", version: BRIDGE_VERSION },
       },
     });
     return;

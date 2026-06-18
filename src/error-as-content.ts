@@ -30,13 +30,30 @@ export function isErrorAsContent(text: string): boolean {
   return ERROR_AS_CONTENT_RE.test(text);
 }
 
+/** Fixed lead every CLI error line starts with, before the HTTP status. */
+const ERROR_LEAD = "API Error: ";
+
 /** True when `text` (a partial prefix) could still turn out to be an
  *  error-as-content response once more chars arrive. Used by the streaming
  *  gate: keep buffering while this holds and the prefix is shorter than
- *  ERROR_SNIFF_CHARS. */
+ *  ERROR_SNIFF_CHARS.
+ *
+ *  Status-agnostic: probing against the literal lead `"API Error: "` (plus
+ *  "the chars after it are still digits") keeps buffering for ANY status
+ *  code. A previous version hardcoded the probe to `"API Error: 400"`, which
+ *  bailed early on the first status digit for non-4xx codes — so a streamed
+ *  `API Error: 529 ...` (overload) or `500/503` (upstream) leaked its partial
+ *  line to the caller as a real delta and disabled retry. */
 export function couldBeErrorAsContent(text: string): boolean {
   if (text.length >= ERROR_SNIFF_CHARS) return isErrorAsContent(text);
-  const probe = "API Error: 400";
   const trimmed = text.replace(/^\s*/, "");
-  return probe.startsWith(trimmed) || isErrorAsContent(text);
+  // Still building up the literal "API Error: " lead itself.
+  if (ERROR_LEAD.startsWith(trimmed)) return true;
+  // Past the lead — keep buffering only while what follows is still a
+  // plausible (digits-only so far) HTTP status code.
+  if (trimmed.startsWith(ERROR_LEAD)) {
+    const rest = trimmed.slice(ERROR_LEAD.length);
+    if (/^\d{1,3}$/.test(rest)) return true;
+  }
+  return isErrorAsContent(text);
 }

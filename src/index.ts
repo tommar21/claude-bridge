@@ -7,18 +7,13 @@ import {
 import { BridgeMcpHttpServer } from "./mcp-http.js";
 import { PersistentSessionPool } from "./session-pool.js";
 import { configureDebugLogger } from "./debug-logger.js";
+import { intEnv } from "./env.js";
 
-const port = parseInt(process.env.CLAUDE_BRIDGE_PORT ?? "3456", 10);
+const port = intEnv("CLAUDE_BRIDGE_PORT", 3456, { min: 0, max: 65535 });
 const host = process.env.CLAUDE_BRIDGE_HOST ?? "127.0.0.1";
-const timeoutMs = parseInt(process.env.CLAUDE_BRIDGE_TIMEOUT_MS ?? "300000", 10);
-const maxConcurrent = parseInt(
-  process.env.CLAUDE_BRIDGE_MAX_CONCURRENT ?? "8",
-  10,
-);
-const maxSessions = parseInt(
-  process.env.CLAUDE_BRIDGE_MAX_SESSIONS ?? "200",
-  10,
-);
+const timeoutMs = intEnv("CLAUDE_BRIDGE_TIMEOUT_MS", 300_000, { min: 1000 });
+const maxConcurrent = intEnv("CLAUDE_BRIDGE_MAX_CONCURRENT", 8, { min: 1 });
+const maxSessions = intEnv("CLAUDE_BRIDGE_MAX_SESSIONS", 200, { min: 1 });
 
 // Path D (persistent CLI per session + in-process MCP) is now the default
 // since v3.5.0 — validated in production with orphanRecoveries=0% after
@@ -29,7 +24,7 @@ const maxSessions = parseInt(
 const pathDEnabled = !/^(0|false|no|off)$/i.test(
   process.env.CLAUDE_BRIDGE_PATH_D ?? "1",
 );
-const pathDPort = parseInt(process.env.CLAUDE_BRIDGE_MCP_PORT ?? "0", 10);
+const pathDPort = intEnv("CLAUDE_BRIDGE_MCP_PORT", 0, { min: 0, max: 65535 });
 
 const debugPromptEnabled = /^(1|true|yes|on)$/i.test(
   process.env.CLAUDE_BRIDGE_DEBUG_PROMPT ?? "",
@@ -48,9 +43,9 @@ const mcpPort = await mcpServer.start(pathDPort, "127.0.0.1");
 const sessionPool = new PersistentSessionPool({
   mcpServer,
   config: {
-    idleEvictMs: parseInt(process.env.CLAUDE_BRIDGE_IDLE_EVICT_MS ?? "600000", 10),
-    maxLifetimeMs: parseInt(process.env.CLAUDE_BRIDGE_MAX_LIFETIME_MS ?? "3600000", 10),
-    maxSessions: parseInt(process.env.CLAUDE_BRIDGE_MAX_PERSISTENT_SESSIONS ?? "32", 10),
+    idleEvictMs: intEnv("CLAUDE_BRIDGE_IDLE_EVICT_MS", 600_000, { min: 1000 }),
+    maxLifetimeMs: intEnv("CLAUDE_BRIDGE_MAX_LIFETIME_MS", 3_600_000, { min: 1000 }),
+    maxSessions: intEnv("CLAUDE_BRIDGE_MAX_PERSISTENT_SESSIONS", 32, { min: 1 }),
     nextCheckpointTimeoutMs: timeoutMs,
   },
 });
@@ -73,17 +68,13 @@ console.log(
 );
 console.log("");
 
-startServer({ port, host });
-
-// Bridge shutdown path already drains CLIs — extend it to also stop the
-// MCP server + persistent pool on SIGTERM/SIGINT.
+// Stop the persistent pool + MCP server as part of the server's single
+// shutdown chain (passed as onShutdown), so they run BEFORE process.exit
+// rather than racing it on a second, uncoordinated SIGTERM/SIGINT handler
+// (which could truncate the MCP/pool cleanup mid-flight).
 async function shutdownExtras(): Promise<void> {
   await sessionPool.shutdown();
   await mcpServer.stop();
 }
-process.on("SIGTERM", () => {
-  void shutdownExtras();
-});
-process.on("SIGINT", () => {
-  void shutdownExtras();
-});
+
+startServer({ port, host }, shutdownExtras);

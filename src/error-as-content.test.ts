@@ -44,3 +44,28 @@ test("couldBeErrorAsContent buffers plausible prefixes only", () => {
     false,
   );
 });
+
+test("couldBeErrorAsContent keeps buffering non-4xx status prefixes (streaming gate)", () => {
+  // Regression: the gate used to hardcode "API Error: 400" as its probe, so a
+  // 5xx/529 error arriving char-by-char (the retryable overload/upstream
+  // class) flushed as a real delta before the 3rd status digit arrived,
+  // leaking the error as chat content and disabling retry.
+  for (const prefix of ["API Error: 5", "API Error: 52", "API Error: 529"]) {
+    assert.equal(couldBeErrorAsContent(prefix), true, prefix);
+  }
+  assert.equal(couldBeErrorAsContent("API Error: 503"), true);
+  assert.equal(couldBeErrorAsContent("API Error: 9"), true);
+  // The bare lead (status not yet arrived) must also keep buffering.
+  assert.equal(couldBeErrorAsContent("API Error:"), true);
+  assert.equal(couldBeErrorAsContent("API Error: "), true);
+});
+
+test("couldBeErrorAsContent flushes once it's clearly not an error line", () => {
+  // After the lead, a non-digit means it's prose, not a status code.
+  assert.equal(couldBeErrorAsContent("API Error: nope"), false);
+  // A full 5xx error line resolves to the strict check.
+  assert.equal(
+    couldBeErrorAsContent('API Error: 529 {"type":"overloaded_error"}'),
+    true,
+  );
+});

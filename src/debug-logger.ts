@@ -1,4 +1,6 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
 interface DebugConfig {
@@ -17,7 +19,23 @@ export function configureDebugLogger(opts: {
     return;
   }
   const date = new Date().toISOString().slice(0, 10);
-  const filePath = opts.filePath ?? `/tmp/claude-bridge-debug-${date}.jsonl`;
+  // Default under a private, owner-only dir rather than world-readable /tmp:
+  // these records contain raw prompt + model-output bodies. mkdir 0700 here +
+  // append 0600 below keep them readable only by the bridge user.
+  const filePath =
+    opts.filePath ??
+    path.join(
+      os.homedir(),
+      ".openclaw",
+      "bridge-debug",
+      `claude-bridge-debug-${date}.jsonl`,
+    );
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  } catch {
+    // Dir creation failed — the first append will throw and be swallowed
+    // (debug logging must never crash the bridge). Leave config set.
+  }
   config = { enabled: true, filePath };
 }
 
@@ -36,7 +54,7 @@ export function debugLog(record: Record<string, unknown>): void {
     return;
   }
   try {
-    fs.appendFileSync(config.filePath, line);
+    fs.appendFileSync(config.filePath, line, { mode: 0o600 });
   } catch {
     // Filesystem error — disk full, perms, etc. Drop.
   }

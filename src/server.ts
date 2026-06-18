@@ -17,8 +17,17 @@ import {
 } from "./cli-worker.js";
 import type { OAIChatRequest } from "./translate.js";
 import { buildPrompt, extractForPathD, toolsFromRequest } from "./translate.js";
+import { intEnv } from "./env.js";
+import { BRIDGE_VERSION } from "./version.js";
 
-export const BRIDGE_VERSION = "3.6.1";
+export { BRIDGE_VERSION };
+
+// Max accepted request body. Generous by default — the matrix gateway / Hermes
+// legitimately send large multi-turn payloads — but bounded so a single huge
+// or slow-drip POST can't buffer unboundedly in memory. Env-tunable.
+const MAX_BODY_BYTES = intEnv("CLAUDE_BRIDGE_MAX_BODY_BYTES", 64 * 1024 * 1024, {
+  min: 64 * 1024,
+});
 
 // Flipped to true on SIGTERM/SIGINT so new chat-completion requests get
 // rejected with 503 while we drain. Health + models stay up for LB checks.
@@ -31,7 +40,10 @@ export interface ServerConfig {
 
 // ─── Server ─────────────────────────────────────────────────────────────────
 
-export function startServer(config: ServerConfig): void {
+export function startServer(
+  config: ServerConfig,
+  onShutdown?: () => Promise<void>,
+): void {
   const server = createServer(async (req, res) => {
     try {
       await handleRequest(req, res);
@@ -56,7 +68,9 @@ export function startServer(config: ServerConfig): void {
   //   2. Close the HTTP server so Node's keep-alive connections drain
   //   3. drainAndShutdown() waits up to 10s for in-flight CLI to finish,
   //      then SIGKILLs stragglers
-  //   4. Hard-stop timer (15s total) as last-resort safety net
+  //   4. onShutdown() (e.g. the persistent pool + MCP server) runs in the SAME
+  //      chain, BEFORE exit, so it isn't truncated by a racing process.exit
+  //   5. Hard-stop timer (15s total) as last-resort safety net
   let shuttingDownPromise: Promise<void> | null = null;
   const shutdown = (signal: string) => {
     if (shuttingDownPromise) return shuttingDownPromise;
@@ -69,10 +83,19 @@ export function startServer(config: ServerConfig): void {
     hardStop.unref();
     shuttingDownPromise = new Promise<void>((resolve) => {
       server.close(() => resolve());
-    }).then(() => drainAndShutdown(10_000)).then(() => {
-      log("info", "Shutdown complete");
-      process.exit(0);
-    });
+    })
+      .then(() => drainAndShutdown(10_000))
+      .then(() => onShutdown?.())
+      .then(() => {
+        log("info", "Shutdown complete");
+        process.exit(0);
+      })
+      .catch((err) => {
+        log("error", "Shutdown error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        process.exit(1);
+      });
     return shuttingDownPromise;
   };
   process.on("SIGTERM", () => {
@@ -161,12 +184,22 @@ async function handleChatCompletions(
       },
     });
   }
-  const body = await readBody(req);
-  if (!body) {
+  const bodyResult = await readBody(req, MAX_BODY_BYTES);
+  if (!bodyResult.ok) {
+    if (bodyResult.reason === "too_large") {
+      return sendJson(res, 413, {
+        error: {
+          message: "Request body too large",
+          type: "invalid_request_error",
+          code: null,
+        },
+      });
+    }
     return sendJson(res, 400, {
       error: { message: "Empty request body", type: "invalid_request_error", code: null },
     });
   }
+  const body = bodyResult.body;
 
   let oaiReq: OAIChatRequest;
   try {
@@ -238,6 +271,13 @@ async function handleChatCompletions(
     ultracode,
   };
 
+  // Cancel the in-flight CLI turn if the client disconnects before we finish,
+  // instead of letting it run to the 300s timeout burning Max quota.
+  const abort = new AbortController();
+  req.on("close", () => {
+    if (!res.writableEnded) abort.abort();
+  });
+
   // Route to Path D (persistent CLI + in-bridge MCP) when:
   //   - Feature flag is enabled
   //   - Request carries a sessionKey (OpenAI `user` field)
@@ -259,17 +299,17 @@ async function handleChatCompletions(
       ultracode,
     };
     if (oaiReq.stream) {
-      await handlePersistentStreaming(req, res, persistentReq, model.id, startTime);
+      await handlePersistentStreaming(req, res, persistentReq, model.id, startTime, abort.signal);
     } else {
-      await handlePersistentNonStreaming(res, persistentReq, model.id, startTime);
+      await handlePersistentNonStreaming(res, persistentReq, model.id, startTime, abort.signal);
     }
     return;
   }
 
   if (oaiReq.stream) {
-    await handleStreaming(req, res, cliReq, model.id, startTime);
+    await handleStreaming(req, res, cliReq, model.id, startTime, abort.signal);
   } else {
-    await handleNonStreaming(res, cliReq, model.id, startTime);
+    await handleNonStreaming(res, cliReq, model.id, startTime, abort.signal);
   }
 }
 
@@ -278,9 +318,10 @@ async function handlePersistentNonStreaming(
   req: Parameters<typeof enqueuePersistent>[0],
   modelId: string,
   startTime: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   try {
-    const result = await enqueuePersistent(req);
+    const result = await enqueuePersistent(req, undefined, signal);
     recordRateLimitStatus(result.rateLimitStatus);
     recordResolvedModel(modelId, result.modelVersion);
     const duration = Date.now() - startTime;
@@ -302,7 +343,7 @@ async function handlePersistentNonStreaming(
     if (!res.headersSent) {
       const isTimeout = message.includes("timeout");
       sendJson(res, isTimeout ? 504 : 500, {
-        error: { message, type: "api_error", code: null },
+        error: { message: sanitizeClientError(message), type: "api_error", code: null },
       });
     }
   }
@@ -314,6 +355,7 @@ async function handlePersistentStreaming(
   req: Parameters<typeof enqueuePersistent>[0],
   modelId: string,
   startTime: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   const msgId = `chatcmpl-${Date.now()}`;
   const ts = Math.floor(Date.now() / 1000);
@@ -340,6 +382,9 @@ async function handlePersistentStreaming(
   };
 
   httpReq.on("close", () => {
+    if (!res.writableEnded) res.destroy();
+  });
+  res.on("error", () => {
     if (!res.writableEnded) res.destroy();
   });
 
@@ -377,7 +422,7 @@ async function handlePersistentStreaming(
         });
         toolCallsEmitted++;
       },
-    });
+    }, signal);
 
     recordRateLimitStatus(result.rateLimitStatus);
     recordResolvedModel(modelId, result.modelVersion);
@@ -396,7 +441,7 @@ async function handlePersistentStreaming(
 
     openSSE();
     const hasToolCalls = result.toolCalls.length > 0;
-    emitChunk({}, hasToolCalls ? "tool_calls" : "stop");
+    emitChunk({}, mapFinishReason(result.stopReason, hasToolCalls));
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (err) {
@@ -405,7 +450,7 @@ async function handlePersistentStreaming(
     if (!sseOpened) {
       const isTimeout = message.includes("timeout");
       sendJson(res, isTimeout ? 504 : 500, {
-        error: { message, type: "api_error", code: null },
+        error: { message: sanitizeClientError(message), type: "api_error", code: null },
       });
       return;
     }
@@ -416,7 +461,7 @@ async function handlePersistentStreaming(
         created: ts,
         model: modelId,
         choices: [{ index: 0, delta: {}, finish_reason: "error" }],
-        error: { message, type: "api_error" },
+        error: { message: sanitizeClientError(message), type: "api_error" },
       });
       res.write("data: [DONE]\n\n");
       res.end();
@@ -431,9 +476,10 @@ async function handleNonStreaming(
   cliReq: Parameters<typeof enqueueRequest>[0],
   modelId: string,
   startTime: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   try {
-    const result = await enqueueRequest(cliReq);
+    const result = await enqueueRequest(cliReq, undefined, signal);
     recordRateLimitStatus(result.rateLimitStatus);
     recordResolvedModel(modelId, result.modelVersion);
     const duration = Date.now() - startTime;
@@ -453,7 +499,7 @@ async function handleNonStreaming(
     if (!res.headersSent) {
       const isTimeout = message.includes("timeout");
       sendJson(res, isTimeout ? 504 : 500, {
-        error: { message, type: "api_error", code: null },
+        error: { message: sanitizeClientError(message), type: "api_error", code: null },
       });
     }
   }
@@ -477,6 +523,7 @@ async function handleStreaming(
   cliReq: Parameters<typeof enqueueRequest>[0],
   modelId: string,
   startTime: number,
+  signal?: AbortSignal,
 ): Promise<void> {
   const msgId = `chatcmpl-${Date.now()}`;
   const ts = Math.floor(Date.now() / 1000);
@@ -507,6 +554,9 @@ async function handleStreaming(
   // the CLI process drag on afterward — the timer in runCLI will eventually
   // kill it, but killing now is cleaner). No-op if no proc attached yet.
   req.on("close", () => {
+    if (!res.writableEnded) res.destroy();
+  });
+  res.on("error", () => {
     if (!res.writableEnded) res.destroy();
   });
 
@@ -544,7 +594,7 @@ async function handleStreaming(
         });
         toolCallsEmitted++;
       },
-    });
+    }, signal);
 
     recordRateLimitStatus(result.rateLimitStatus);
     recordResolvedModel(modelId, result.modelVersion);
@@ -561,7 +611,7 @@ async function handleStreaming(
 
     openSSE();
     const hasToolCalls = result.toolCalls.length > 0;
-    emitChunk({}, hasToolCalls ? "tool_calls" : "stop");
+    emitChunk({}, mapFinishReason(result.stopReason, hasToolCalls));
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (err) {
@@ -578,7 +628,7 @@ async function handleStreaming(
       // Nothing committed — emit a structured JSON error like non-streaming.
       const isTimeout = message.includes("timeout");
       sendJson(res, isTimeout ? 504 : 500, {
-        error: { message, type: "api_error", code: null },
+        error: { message: sanitizeClientError(message), type: "api_error", code: null },
       });
       return;
     }
@@ -591,7 +641,7 @@ async function handleStreaming(
         created: ts,
         model: modelId,
         choices: [{ index: 0, delta: {}, finish_reason: "error" }],
-        error: { message, type: "api_error" },
+        error: { message: sanitizeClientError(message), type: "api_error" },
       });
       res.write("data: [DONE]\n\n");
       res.end();
@@ -602,6 +652,30 @@ async function handleStreaming(
 }
 
 // ─── Response Formatting ────────────────────────────────────────────────────
+
+/** Map the Claude/Anthropic stop_reason to a valid OpenAI finish_reason.
+ *  OpenAI's enum is {stop, length, tool_calls, content_filter, function_call}.
+ *  Every terminal site previously emitted just `hasToolCalls ? "tool_calls" :
+ *  "stop"`, discarding the real stop_reason — so a max-tokens truncation was
+ *  reported as a normal "stop" and a caller couldn't tell the reply was cut
+ *  off. */
+function mapFinishReason(
+  stopReason: string | undefined,
+  hasToolCalls: boolean,
+): string {
+  if (hasToolCalls) return "tool_calls";
+  switch (stopReason) {
+    case "tool_use":
+      return "tool_calls";
+    case "max_tokens":
+      return "length";
+    case "refusal":
+      return "content_filter";
+    // end_turn, stop_sequence, pause_turn, undefined → normal stop
+    default:
+      return "stop";
+  }
+}
 
 function buildCompletionResponse(
   result: CLIResult,
@@ -624,7 +698,7 @@ function buildCompletionResponse(
       {
         index: 0,
         message,
-        finish_reason: hasToolCalls ? "tool_calls" : "stop",
+        finish_reason: mapFinishReason(result.stopReason, hasToolCalls),
       },
     ],
     usage: {
@@ -648,20 +722,64 @@ function toOAIToolCall(tc: CLIToolCall): Record<string, unknown> {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/** Strip raw `claude` CLI stderr from an error message before it reaches the
+ *  HTTP client. The CLI worker appends stderr as a " | stderr: …" tail (and
+ *  emits "CLI exited N: <stderr>") which can contain absolute file paths or
+ *  auth-state hints. The full message still goes to structured logs and to the
+ *  retry classifier — only the client-facing copy is trimmed. */
+function sanitizeClientError(message: string): string {
+  let m = message;
+  const sIdx = m.indexOf(" | stderr:");
+  if (sIdx >= 0) m = m.slice(0, sIdx);
+  m = m.replace(/^(CLI exited -?\d+):[\s\S]*$/, "$1");
+  return m;
+}
+
 function writeSSE(res: ServerResponse, data: unknown): void {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-function readBody(req: IncomingMessage): Promise<string | null> {
+type ReadBodyResult =
+  | { ok: true; body: string }
+  | { ok: false; reason: "empty" | "too_large" };
+
+function readBody(
+  req: IncomingMessage,
+  maxBytes: number,
+): Promise<ReadBodyResult> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8") || null));
-    req.on("error", () => resolve(null));
+    let size = 0;
+    let settled = false;
+    const settle = (r: ReadBodyResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(r);
+    };
+    req.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        // Reject before the whole payload buffers in memory.
+        settle({ ok: false, reason: "too_large" });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf-8");
+      settle(body ? { ok: true, body } : { ok: false, reason: "empty" });
+    });
+    req.on("error", () => settle({ ok: false, reason: "empty" }));
   });
 }
 
 function sendJson(res: ServerResponse, status: number, data: unknown): void {
+  // The client may have disconnected (socket destroyed on req close / abort);
+  // writing headers to a destroyed response throws. Guard once here so every
+  // error/response path is safe instead of repeating the check at each site.
+  if (res.destroyed || res.headersSent) return;
   const body = JSON.stringify(data);
   res.writeHead(status, {
     "Content-Type": "application/json",

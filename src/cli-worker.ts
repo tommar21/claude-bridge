@@ -246,6 +246,7 @@ function gateErrorAsContent(handlers: StreamEventHandlers | undefined): {
 export async function enqueuePersistent(
   request: PersistentCLIRequest,
   handlers?: StreamEventHandlers,
+  signal?: AbortSignal,
 ): Promise<CLIResult> {
   if (!pathDConfig || !pathDConfig.enabled) {
     throw new Error("Path D is not enabled");
@@ -255,6 +256,7 @@ export async function enqueuePersistent(
   // Per-session serialization is still required: two concurrent requests
   // for the same sessionKey would race on the CLI's stream.
   return serializeOnSession(request.sessionKey, async () => {
+    if (signal?.aborted) throw new Error("client aborted");
     await acquireSlot();
     log("info", "PathD queue", { active: inFlight, waiting: waiters.length });
     const requestId = newRequestId();
@@ -288,6 +290,17 @@ export async function enqueuePersistent(
       const acquired = sessionPool.acquire(request.sessionKey, acquireSpec);
       let session = acquired.session;
       let isFresh = acquired.isFresh;
+      // acquire() decided 'reuse' from a liveness snapshot, but a persistent
+      // CLI can exit in the gap before we send (the pool itself notes CLIs
+      // can die between turns). If the reused session is already dead, tear it
+      // down and respawn fresh now, rather than letting sendUserMessage throw
+      // a hard "session is dead" the caller can't recover from.
+      if (!isFresh && session.dead) {
+        sessionPool.teardown(request.sessionKey);
+        const reAcquired = sessionPool.acquire(request.sessionKey, acquireSpec);
+        session = reAcquired.session;
+        isFresh = reAcquired.isFresh;
+      }
       debugLog({
         requestId,
         phase: "request",
@@ -355,6 +368,16 @@ export async function enqueuePersistent(
       } else {
         // Initial: feed the user message to stdin.
         session.sendUserMessage(request.lastUserContent);
+      }
+
+      // Client disconnect: tear down this session's CLI so the turn doesn't run
+      // to the 300s timeout burning Max quota. Killing the child closes the
+      // stream, which makes nextCheckpoint unwind to an error checkpoint (and
+      // the catch below tears down again, idempotently).
+      if (signal) {
+        const onAbort = () => sessionPool.teardown(request.sessionKey);
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
       }
 
       const gate = gateErrorAsContent(handlers);
@@ -425,6 +448,16 @@ export async function enqueuePersistent(
       };
     } catch (err) {
       metrics.failures++;
+      // A timeout or an unexpected stream close leaves the persistent CLI in
+      // an unknown state (possibly still mid-generation) — the catch block
+      // previously left it alive and reusable, so the next request inherited
+      // a stuck/poisoned session. Tear it down so the next acquire respawns
+      // clean. (The error-as-content branch above already tears down on its
+      // own poisoned-turn path.)
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/nextCheckpoint timeout|stream closed unexpectedly|session is dead|client aborted/i.test(msg)) {
+        sessionPool.teardown(request.sessionKey);
+      }
       throw err;
     } finally {
       releaseSlot();
@@ -592,6 +625,7 @@ function isTransient(err: unknown): boolean {
 async function runCLIWithRetry(
   request: CLIRequest,
   handlers?: StreamEventHandlers,
+  signal?: AbortSignal,
 ): Promise<CLIResult> {
   const maxAttempts = 3;
   // Observed quota windows ("out of extra usage") last seconds to ~2min;
@@ -618,10 +652,13 @@ async function runCLIWithRetry(
     : undefined;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (signal?.aborted) throw new Error("client aborted");
     try {
-      return await runCLI(request, trackedHandlers);
+      return await runCLI(request, trackedHandlers, signal);
     } catch (err) {
       lastErr = err;
+      // Never retry a client abort — the caller is gone.
+      if (signal?.aborted) throw err;
       const canRetry =
         attempt < maxAttempts && !committed && isTransient(err);
       if (!canRetry) throw err;
@@ -641,18 +678,20 @@ async function runCLIWithRetry(
 export async function enqueueRequest(
   request: CLIRequest,
   handlers?: StreamEventHandlers,
+  signal?: AbortSignal,
 ): Promise<CLIResult> {
   // Per-session serialization first, then global concurrency. Order matters:
   // if two requests on session X arrive while a third on session Y runs, Y
   // goes parallel to the first X; the second X waits for the first X to
   // finish before consuming a concurrency slot.
   return serializeOnSession(request.sessionKey, async () => {
+    if (signal?.aborted) throw new Error("client aborted");
     await acquireSlot();
     log("info", "Queue", { active: inFlight, waiting: waiters.length });
     metrics.totalRequests++;
     const startedAt = Date.now();
     try {
-      const result = await runCLIWithRetry(request, handlers);
+      const result = await runCLIWithRetry(request, handlers, signal);
       metrics.successes++;
       metrics.latencyMsSum += Date.now() - startedAt;
       metrics.latencyMsCount++;
@@ -669,7 +708,9 @@ export async function enqueueRequest(
 async function runCLI(
   request: CLIRequest,
   handlers?: StreamEventHandlers,
+  signal?: AbortSignal,
 ): Promise<CLIResult> {
+  if (signal?.aborted) throw new Error("client aborted");
   const { sessionId, isNew } = getOrCreateSessionId(request.sessionKey);
   const hasTools = request.tools.length > 0;
 
@@ -753,6 +794,42 @@ async function runCLI(
   activeProcs.add(proc);
   proc.once("close", () => activeProcs.delete(proc));
 
+  // Surface spawn failures (ENOENT — `claude` not on PATH) and stdin EPIPE
+  // (CLI exited before reading the prompt) as a rejected promise instead of
+  // an unhandled 'error' event. With no listener Node escalates that event to
+  // an uncaught exception that crashes the whole bridge — taking down every
+  // in-flight request, not just this one. ENOENT/EPIPE are not in
+  // TRANSIENT_PATTERNS, so runCLIWithRetry fails fast with a clear message
+  // instead of hammering a missing binary. (On ENOENT 'close' never fires, so
+  // we also drop the proc from activeProcs here to avoid a drain-time leak.)
+  const procError = new Promise<never>((_, reject) => {
+    proc.once("error", (err) => {
+      activeProcs.delete(proc);
+      if (request.sessionKey) sessions.delete(request.sessionKey);
+      const detail = err instanceof Error ? err.message : String(err);
+      reject(new Error(`CLI spawn error: ${detail}`));
+    });
+  });
+  proc.stdin?.on("error", () => {
+    // EPIPE when the CLI exits before reading stdin. The close/error paths
+    // surface the real failure; swallow here so the stream 'error' isn't
+    // unhandled.
+  });
+
+  // Client disconnect: SIGKILL the CLI immediately so the turn doesn't run to
+  // the timeout burning Max quota, and reject the request promptly.
+  const abortError = new Promise<never>((_, reject) => {
+    if (!signal) return;
+    const onAbort = () => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+      reject(new Error("client aborted"));
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+
   proc.stdin?.write(promptToSend);
   proc.stdin?.end();
 
@@ -765,12 +842,16 @@ async function runCLI(
 
   try {
     const gate = gateErrorAsContent(handlers);
-    const [parsed, exitCode, stderrText] = await Promise.all([
-      parseStream(linesOf(proc.stdout!), gate.handlers),
-      new Promise<number | null>((resolve) =>
-        proc.on("close", (code) => resolve(code)),
-      ),
-      collectStream(proc.stderr!),
+    const [parsed, exitCode, stderrText] = await Promise.race([
+      Promise.all([
+        parseStream(linesOf(proc.stdout!), gate.handlers),
+        new Promise<number | null>((resolve) =>
+          proc.on("close", (code) => resolve(code)),
+        ),
+        collectStream(proc.stderr!),
+      ]),
+      procError,
+      abortError,
     ]);
     gate.finalize();
 
@@ -1024,11 +1105,20 @@ export function cleanupStaleTempFiles(): void {
   try {
     const tmp = os.tmpdir();
     const entries = fs.readdirSync(tmp);
+    // Only reap files older than this window. A second bridge instance (a
+    // launchd respawn overlapping the old one) or a request spawned a beat
+    // before this sweep writes a fresh bridge-tools-<uuid>.json that a live
+    // `claude` MCP child is actively reading — unlinking it mid-request breaks
+    // that turn. The age guard scopes the sweep to genuinely crash-leaked
+    // files while leaving any in-flight config untouched.
+    const staleBeforeMs = Date.now() - 5 * 60_000;
     let removed = 0;
     for (const name of entries) {
       if (!name.startsWith("bridge-") || !name.endsWith(".json")) continue;
+      const full = path.join(tmp, name);
       try {
-        fs.unlinkSync(path.join(tmp, name));
+        if (fs.statSync(full).mtimeMs > staleBeforeMs) continue; // too fresh
+        fs.unlinkSync(full);
         removed++;
       } catch {}
     }

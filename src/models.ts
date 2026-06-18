@@ -24,7 +24,7 @@ const MODELS: BridgeModel[] = [
   {
     id: "claude-haiku-4",
     cliAlias: "haiku",
-    name: "Claude Haiku 4.5",
+    name: "Claude Haiku 4",
     contextWindow: 200_000,
     maxOutputTokens: 8_192,
   },

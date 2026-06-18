@@ -62,6 +62,10 @@ interface SessionContext {
   sessionKey: string;
   tools: McpTool[];
   pending: Map<string, PendingCall>;
+  /** waitForPending resolvers keyed by toolUseId. handleToolsCall wakes them
+   *  the instant the matching pending is created, so the common path resolves
+   *  on an event instead of a busy poll. */
+  waiters: Map<string, Array<() => void>>;
 }
 
 const JSON_RPC_INVALID = -32600;
@@ -73,6 +77,25 @@ const JSON_RPC_METHOD_NOT_FOUND = -32601;
  *  `toolu_*` id the CLI registered. */
 function sanitizeId(id: string): string {
   return id.replace(/[^a-zA-Z0-9]/g, "");
+}
+
+/** True when an HTTP Host header refers to the loopback interface (or is
+ *  absent — some minimal MCP clients omit it). Strips the port and unwraps an
+ *  IPv6 literal's brackets. Used as the anti-DNS-rebinding allowlist for the
+ *  loopback-bound MCP server. Exported for testing. */
+export function isLoopbackHost(host: string | undefined): boolean {
+  if (!host) return true;
+  const raw = host.trim();
+  if (!raw) return true;
+  const hostname = raw.startsWith("[")
+    ? raw.slice(1, raw.indexOf("]")) // [::1]:port → ::1
+    : raw.split(":")[0]; // 127.0.0.1:port → 127.0.0.1
+  return (
+    hostname === "127.0.0.1" ||
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    hostname === "0.0.0.0"
+  );
 }
 
 export class BridgeMcpHttpServer {
@@ -117,7 +140,7 @@ export class BridgeMcpHttpServer {
   registerSession(sessionKey: string, tools: McpTool[]): void {
     let ctx = this.sessions.get(sessionKey);
     if (!ctx) {
-      ctx = { sessionKey, tools, pending: new Map() };
+      ctx = { sessionKey, tools, pending: new Map(), waiters: new Map() };
       this.sessions.set(sessionKey, ctx);
     } else {
       ctx.tools = tools;
@@ -148,14 +171,47 @@ export class BridgeMcpHttpServer {
     if (!ctx) throw new Error(`session not registered: ${sessionKey}`);
     if (this.findPending(ctx, toolUseId)) return;
     const deadline = Date.now() + timeoutMs;
-    // Tight polling is fine here: the MCP POST usually lands within a few
-    // event-loop ticks, and the only alternative (wiring per-id events)
-    // bloats the pending-call data structure for a race that's ~ms wide.
-    while (Date.now() < deadline) {
-      if (this.findPending(ctx, toolUseId)) return;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    throw new Error(`waitForPending timeout: ${toolUseId} did not arrive within ${timeoutMs}ms`);
+    // Resolve on whichever fires first: the exact-id creation EVENT (the
+    // common path — handleToolsCall wakes us the instant the pending lands,
+    // and waitForPending is always called with the canonical CLI id that the
+    // pending is keyed under, so the event hits), or a COARSE poll backstop
+    // (covers any missed event / fuzzy-id edge without the old 10ms busy
+    // loop's per-tick Promise+timer churn).
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      const onEvent = (): void => {
+        if (this.findPending(ctx, toolUseId)) finish();
+      };
+      const finish = (err?: Error): void => {
+        if (done) return;
+        done = true;
+        clearInterval(poll);
+        const ws = ctx.waiters.get(toolUseId);
+        if (ws) {
+          const i = ws.indexOf(onEvent);
+          if (i >= 0) ws.splice(i, 1);
+          if (ws.length === 0) ctx.waiters.delete(toolUseId);
+        }
+        if (err) reject(err);
+        else resolve();
+      };
+      const arr = ctx.waiters.get(toolUseId) ?? [];
+      arr.push(onEvent);
+      ctx.waiters.set(toolUseId, arr);
+      const poll = setInterval(() => {
+        if (this.findPending(ctx, toolUseId)) finish();
+        else if (Date.now() >= deadline) {
+          finish(
+            new Error(
+              `waitForPending timeout: ${toolUseId} did not arrive within ${timeoutMs}ms`,
+            ),
+          );
+        }
+      }, 100);
+      // Re-check synchronously in case the pending landed between the initial
+      // findPending above and registering the waiter.
+      if (this.findPending(ctx, toolUseId)) finish();
+    });
   }
 
   /** Try to deliver a tool_result. Returns true on success, false if the
@@ -272,6 +328,18 @@ export class BridgeMcpHttpServer {
   // ─── HTTP handling ──────────────────────────────────────────────────────
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Anti-DNS-rebinding guard. This server binds loopback and is only ever
+    // reached by the local `claude` CLI (Host: 127.0.0.1:<port>). Reject any
+    // request whose Host header points elsewhere — a browser/page tricked via
+    // a DNS-rebinding attack would carry the attacker's hostname, and without
+    // this check it could enumerate a session's tool schemas (tools/list) or
+    // inject tool results (tools/call). The MCP transport spec recommends
+    // exactly this Host-allowlist defense.
+    if (!isLoopbackHost(req.headers.host)) {
+      this.writeJson(res, 403, { error: "forbidden host" });
+      return;
+    }
+
     // CLI does a GET for SSE on the same URL as part of MCP HTTP transport
     // discovery; we don't need streaming, so reply with 405.
     if (req.method === "GET") {
@@ -406,6 +474,14 @@ export class BridgeMcpHttpServer {
     // post-v3.4.4 since orphan-recovery-driven respawns stopped, but the
     // guard is cheap and defensive.)
     ctx.pending.set(toolUseId, pending);
+    // Wake anyone blocked in waitForPending for this tool_use. The stream-json
+    // event the bridge reads usually beats this POST by a few ms; this is the
+    // fast path that lets the waiter resolve on an event instead of a poll.
+    const woken = ctx.waiters.get(toolUseId);
+    if (woken && woken.length) {
+      ctx.waiters.delete(toolUseId);
+      for (const w of woken.slice()) w();
+    }
     process.stdout.write(
       `${JSON.stringify({
         ts: new Date().toISOString(),
