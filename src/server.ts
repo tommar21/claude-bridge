@@ -192,13 +192,25 @@ async function handleChatCompletions(
   const bodyResult = await readBody(req, MAX_BODY_BYTES);
   if (!bodyResult.ok) {
     if (bodyResult.reason === "too_large") {
-      return sendJson(res, 413, {
-        error: {
-          message: "Request body too large",
-          type: "invalid_request_error",
-          code: null,
-        },
-      });
+      // The client may still be uploading. Flush a 413 with Connection: close
+      // so the status reaches the client, then the socket closes (aborting the
+      // rest) — instead of draining a huge body or racing a reset.
+      if (!res.headersSent && !res.destroyed) {
+        const payload = JSON.stringify({
+          error: {
+            message: "Request body too large",
+            type: "invalid_request_error",
+            code: null,
+          },
+        });
+        res.writeHead(413, {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+          Connection: "close",
+        });
+        res.end(payload);
+      }
+      return;
     }
     return sendJson(res, 400, {
       error: { message: "Empty request body", type: "invalid_request_error", code: null },
@@ -687,9 +699,10 @@ function readBody(
       if (settled) return;
       size += chunk.length;
       if (size > maxBytes) {
-        // Reject before the whole payload buffers in memory.
+        // Stop buffering and let the caller send a 413. We do NOT destroy the
+        // request here — that races the response and the client gets a reset
+        // instead of a clean 413; the 413 path closes the socket itself.
         settle({ ok: false, reason: "too_large" });
-        req.destroy();
         return;
       }
       chunks.push(chunk);
