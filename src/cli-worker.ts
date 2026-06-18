@@ -44,6 +44,12 @@ Ultracode mode is on. For any substantive task (research, analysis, multi-file e
 This reminder is sticky for the conversation.
 </system-reminder>`;
 
+/** Closed set of CLI `--effort` values. The value drives runtime model
+ *  behavior (thinking budget), so it's a union, not a bare string — the
+ *  untrusted X-Bridge-Effort header is narrowed to this once at the HTTP
+ *  boundary, and the rest of the pipeline is compile-time safe. */
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface ToolDefinition {
   name: string;
   description?: string;
@@ -57,10 +63,10 @@ export interface CLIRequest {
   systemPrompt?: string;
   tools: ToolDefinition[];
   sessionKey?: string;
-  /** Optional CLI --effort passthrough. Allowed values: low|medium|high|xhigh|max.
-   *  When omitted, the CLI uses its built-in default (currently medium). Higher
-   *  effort = more thinking tokens = slower + costlier but better reasoning. */
-  effort?: string;
+  /** Optional CLI --effort passthrough. When omitted, the CLI uses its
+   *  built-in default (currently medium). Higher effort = more thinking
+   *  tokens = slower + costlier but better reasoning. */
+  effort?: Effort;
   /** When true: force --effort xhigh AND append an ultracode system-reminder
    *  to the system prompt nudging the model to default to spawning parallel
    *  subagents for substantive work. Use for "investigate heavy" style turns;
@@ -146,7 +152,7 @@ export interface PersistentCLIRequest {
    *  fresh. Sent as the first user message INSTEAD of lastUserContent. */
   primingPrompt: string | undefined;
   /** See CLIRequest.effort. */
-  effort?: string;
+  effort?: Effort;
   /** See CLIRequest.ultracode. */
   ultracode?: boolean;
 }
@@ -155,7 +161,7 @@ function fingerprint(spec: {
   model: string;
   tools: McpTool[];
   systemPrompt: string | undefined;
-  effort?: string;
+  effort?: Effort;
 }): string {
   const hash = createHash("sha256");
   hash.update(spec.model);

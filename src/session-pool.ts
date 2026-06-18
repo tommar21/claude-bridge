@@ -34,6 +34,7 @@ import type { BridgeMcpHttpServer, CapturedToolUse, McpTool } from "./mcp-http.j
 import { linesOf, parseStream, type StreamEventHandlers } from "./stream-parser.js";
 import { formatUserMessageLine } from "./user-message-format.js";
 import type { ContentBlock } from "./translate.js";
+import type { Effort } from "./cli-worker.js";
 import { decideSessionAction } from "./session-pool-decision.js";
 
 export interface SessionSpec {
@@ -43,10 +44,10 @@ export interface SessionSpec {
   /** Fingerprint used to decide whether an existing session is reusable.
    *  Caller builds this — typically sha256(sortedTools + systemPrompt). */
   spec_fp: string;
-  /** Optional CLI --effort passthrough (low|medium|high|xhigh|max). Forms
-   *  part of the spec_fp so changing effort between requests triggers a
-   *  respawn — the CLI accepts --effort only at startup. */
-  effort?: string;
+  /** Optional CLI --effort passthrough. Forms part of the spec_fp so changing
+   *  effort between requests triggers a respawn — the CLI accepts --effort
+   *  only at startup. */
+  effort?: Effort;
 }
 
 export interface TurnCheckpoint {

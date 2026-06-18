@@ -78,28 +78,67 @@ export function toContentBlocks(content: OAIMessage["content"]): ContentBlock[] 
     if (part.type === "text" && part.text != null) {
       blocks.push({ type: "text", text: part.text });
     } else if (part.type === "image_url" && part.image_url?.url) {
-      blocks.push(toImageBlock(part.image_url));
+      const block = toImageBlock(part.image_url);
+      if (block) blocks.push(block);
     }
     // unknown types: drop. Stage 1 only handles text + image.
   }
   return blocks;
 }
 
-function toImageBlock(image: { url: string; detail?: string }): ContentBlock {
-  // Data URL: data:<media-type>[;<param>...];base64,<data>
-  // Handles RFC 2397 multi-param URLs such as data:image/png;charset=utf-8;base64,...
-  const dataUrlMatch = image.url.match(/^data:([^;,]+)(?:;[^;,=]+(?:=[^;,]*)?)*;base64,(.+)$/);
-  if (dataUrlMatch) {
+/** Translate an OpenAI image_url into an Anthropic image block.
+ *
+ *  Returns null (drop) for anything we can't represent, rather than handing
+ *  Anthropic a non-fetchable `data:` URL as if it were an http source — the
+ *  old code fell through to a `{type:"url"}` source for ANY non-`;base64,`
+ *  input (e.g. `data:image/svg+xml;utf8,<svg>`), which Anthropic rejects. */
+export function toImageBlock(image: { url: string; detail?: string }): ContentBlock | null {
+  const url = image.url;
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    return { type: "image", source: { type: "url", url } };
+  }
+  // data:<media-type>[;<param>...];base64,<data>  (multi-param per RFC 2397)
+  const base64Match = url.match(/^data:([^;,]+)(?:;[^;,=]+(?:=[^;,]*)?)*;base64,(.+)$/);
+  if (base64Match) {
     return {
       type: "image",
-      source: {
-        type: "base64",
-        media_type: dataUrlMatch[1],
-        data: dataUrlMatch[2],
-      },
+      source: { type: "base64", media_type: base64Match[1], data: base64Match[2] },
     };
   }
-  return { type: "image", source: { type: "url", url: image.url } };
+  // Inline (non-base64) data URL, e.g. data:image/svg+xml,<svg...> or
+  // data:image/png;utf8,...  — decode the payload to base64 so Anthropic gets
+  // a valid base64 source instead of an unfetchable data: URL.
+  const inlineMatch = url.match(/^data:([^;,]+)(?:;[^;,]+)*,(.*)$/);
+  if (inlineMatch) {
+    try {
+      const data = Buffer.from(decodeURIComponent(inlineMatch[2]), "utf-8").toString("base64");
+      return { type: "image", source: { type: "base64", media_type: inlineMatch[1], data } };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Escape a string for safe interpolation into an XML attribute / element. */
+function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/** Re-stringify OpenAI tool-call arguments to guaranteed-valid JSON. The OAI
+ *  `arguments` string is valid JSON only by convention; if it's empty or
+ *  malformed, embedding it raw produced corrupt JSON inside <tool_call>. */
+function safeJsonArgs(raw: string | undefined): string {
+  if (!raw) return "{}";
+  try {
+    return JSON.stringify(JSON.parse(raw));
+  } catch {
+    return "{}";
+  }
 }
 
 // ─── Prompt Building ────────────────────────────────────────────────────────
@@ -141,8 +180,11 @@ export function buildPrompt(oai: OAIChatRequest): BuiltPrompt {
         const toolParts: string[] = [];
         if (msg.tool_calls) {
           for (const tc of msg.tool_calls) {
+            // JSON.stringify the name (proper escaping inside the JSON literal)
+            // and re-stringify arguments so the embedded JSON is always valid,
+            // even if the caller sent an empty/malformed `arguments` string.
             toolParts.push(
-              `<tool_call>{"name":"${tc.function.name}","arguments":${tc.function.arguments}}</tool_call>`,
+              `<tool_call>{"name":${JSON.stringify(tc.function.name)},"arguments":${safeJsonArgs(tc.function.arguments)}}</tool_call>`,
             );
           }
         }
@@ -153,8 +195,11 @@ export function buildPrompt(oai: OAIChatRequest): BuiltPrompt {
         break;
       }
       case "tool":
+        // Escape only the attribute value (a stray `"` would break the tag).
+        // The body is left as-is on purpose: it's narration the model reads,
+        // and escaping `<`/`>` would corrupt code/markup inside tool results.
         conversationParts.push(
-          `<tool_result tool_call_id="${msg.tool_call_id ?? ""}">${extractText(msg.content)}</tool_result>`,
+          `<tool_result tool_call_id="${xmlEscape(msg.tool_call_id ?? "")}">${extractText(msg.content)}</tool_result>`,
         );
         break;
     }

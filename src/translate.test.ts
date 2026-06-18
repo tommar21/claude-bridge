@@ -1,6 +1,67 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { toContentBlocks } from "./translate.ts";
+import { toContentBlocks, buildPrompt } from "./translate.ts";
+
+test("toContentBlocks: http(s) image_url -> url source", () => {
+  const blocks = toContentBlocks([
+    { type: "image_url", image_url: { url: "https://x.test/a.png" } },
+  ]);
+  assert.deepEqual(blocks, [
+    { type: "image", source: { type: "url", url: "https://x.test/a.png" } },
+  ]);
+});
+
+test("toContentBlocks: base64 data URL -> base64 source", () => {
+  const blocks = toContentBlocks([
+    { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
+  ]);
+  assert.deepEqual(blocks, [
+    { type: "image", source: { type: "base64", media_type: "image/png", data: "QUJD" } },
+  ]);
+});
+
+test("toContentBlocks: non-base64 data URL is decoded to base64, not passed as a url", () => {
+  // Regression: the old code fell through to a {type:'url'} source for any
+  // non-`;base64,` data URL, handing Anthropic an unfetchable data: URL.
+  const blocks = toContentBlocks([
+    { type: "image_url", image_url: { url: "data:image/svg+xml,%3Csvg%3E%3C%2Fsvg%3E" } },
+  ]);
+  assert.equal(blocks.length, 1);
+  const src = (blocks[0] as { source: { type: string; media_type?: string; data?: string } }).source;
+  assert.equal(src.type, "base64");
+  assert.equal(src.media_type, "image/svg+xml");
+  assert.equal(Buffer.from(src.data ?? "", "base64").toString("utf-8"), "<svg></svg>");
+});
+
+test("buildPrompt: tool_call args are re-stringified to valid JSON; name is escaped", () => {
+  const out = buildPrompt({
+    model: "m",
+    messages: [
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          // malformed/empty arguments + a name with a quote
+          { id: "c1", type: "function", function: { name: 'we"ird', arguments: "" } },
+        ],
+      },
+    ],
+  });
+  // Empty arguments -> {} ; name JSON-escaped -> the embedded JSON parses.
+  const m = out.prompt.match(/<tool_call>(.*)<\/tool_call>/s);
+  assert.ok(m, "has a <tool_call> block");
+  const parsed = JSON.parse(m![1]);
+  assert.equal(parsed.name, 'we"ird');
+  assert.deepEqual(parsed.arguments, {});
+});
+
+test("buildPrompt: tool_result attribute id is XML-escaped", () => {
+  const out = buildPrompt({
+    model: "m",
+    messages: [{ role: "tool", tool_call_id: 'a"b<c', content: "result text" }],
+  });
+  assert.match(out.prompt, /tool_call_id="a&quot;b&lt;c"/);
+});
 
 test("toContentBlocks: string content becomes single text block", () => {
   assert.deepEqual(toContentBlocks("hello"), [{ type: "text", text: "hello" }]);
