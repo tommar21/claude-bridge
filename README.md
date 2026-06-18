@@ -1,136 +1,148 @@
 # Claude Bridge
 
-High-performance OpenAI-compatible proxy for Anthropic Claude API using OAuth tokens from Claude Max subscriptions.
-
-**Zero CLI dependencies.** Unlike other proxies that spawn Claude Code CLI subprocesses (slow, sequential, fragile), this bridge makes direct API calls to Anthropic with native format translation. Full concurrency, real streaming, native tool calling.
+OpenAI-compatible proxy for Claude, backed by a pool of local **Claude CLI**
+workers with **MCP-based structured tool calling**. Lets any OpenAI-compatible
+client (the OpenClaw matrix gateway, Hermes Agent, IDEs, agent frameworks) talk
+to Claude through a Claude Max/Pro subscription — the bridge drives the `claude`
+CLI, which owns the auth, so no API key or token extraction is required.
 
 ## Architecture
 
 ```
-OpenClaw/Client → Claude Bridge (port 3456) → api.anthropic.com
-                       ↕
-              OAuth token from env
-              OpenAI ↔ Anthropic translation
+OpenAI client → Claude Bridge (:3456) → `claude` CLI (stream-json) → Anthropic
+                      ↕
+            OpenAI ↔ Claude translation
+            in-process MCP HTTP server (structured tool calls)
 ```
+
+The bridge spawns the official `claude` CLI with `--output-format stream-json`
+and parses its event stream. Tool calls are exposed to the model through an
+**in-process MCP server** so the model emits real structured `tool_use` blocks
+(no XML-in-text). Two execution paths:
+
+- **Path D (default, persistent sessions)** — when the request carries a
+  session key (the OpenAI `user` field), it reuses a long-running `claude`
+  process per session. The first turn with prior history primes the session by
+  sending the full conversation as one user message; later turns deliver only
+  the incremental message via native `tool_use`/`tool_result` — no XML re-injection
+  each turn. Set `CLAUDE_BRIDGE_PATH_D=0` to disable and always spawn fresh.
+- **Legacy (spawn-per-request)** — used when Path D is disabled or no session
+  key is present. One `claude` subprocess per request.
 
 ## Features
 
-- **Direct API calls** — no CLI subprocess overhead, handles concurrent requests
-- **Native tool calling** — uses Anthropic's native tool API, not XML injection
-- **Real streaming** — incremental SSE tokens including tool call streaming
-- **Auto-retry** — exponential backoff on 429/529/5xx with retry-after support
-- **Model mapping** — friendly aliases (`claude-sonnet-4`) to full Anthropic IDs
+- **Native tool calling** — MCP-registered structured tools, not XML injection
+- **Real streaming** — incremental SSE tokens including tool-call streaming
+- **Persistent sessions (Path D)** — reuse one CLI process per session key
+- **Auto-retry** — fixed 2s/8s backoff (max 3 attempts) for *transient* failures
+  only (timeouts, 5xx, overloaded/rate-limit, "out of extra usage"), and only
+  before any byte has been streamed to the caller
+- **Error-as-content guard** — the CLI sometimes prints an upstream failure
+  (`API Error: 529 …`) as plain assistant text; the bridge detects this (any
+  HTTP status, streaming or not) and surfaces it as a real error so callers
+  retry/fallback instead of delivering the error as a chat reply
+- **Per-request hints via headers** — `X-Bridge-Effort` and `X-Bridge-Ultracode`
+- **Model aliases** — friendly ids mapped to the CLI's `--model` aliases
 - **Vision support** — translates base64 image content between formats
-- **Docker-ready** — multi-stage Dockerfile, health check, graceful shutdown
-- **Zero runtime deps** — pure Node.js, no npm dependencies in production
-- **Path D persistent sessions** — when `user` is set, requests reuse a long-running `claude` CLI process via MCP-based structured tool calling; no subprocess spawning overhead on subsequent turns
+- **Graceful shutdown** — drains in-flight CLIs, then SIGKILLs stragglers
 
-### Path D Priming (v3.4.0+)
+## Requirements
 
-**Path D priming**: when a request arrives with `user` set and prior conversation history (more than one user/tool message), the bridge primes a fresh persistent CLI session by sending the full conversation history as the first user message. The model's response answers the user's latest question. Subsequent turns on the same session deliver only the incremental message via native tool_use/tool_result blocks — no XML pseudo-tag re-injection on every turn.
+- Node **22+**
+- The `claude` CLI installed and authenticated (e.g. via Claude Max/Pro login).
+  The bridge passes the parent environment through to the child, so a
+  `claude`-recognized `ANTHROPIC_API_KEY` also works if set.
 
 ## Quick Start
 
-### Docker (recommended)
+```bash
+npm install && npm run build
+npm start            # listens on 127.0.0.1:3456 by default
+```
+
+Point your OpenAI-compatible client's base URL at `http://127.0.0.1:3456/v1`.
+
+### Docker
 
 ```bash
 docker build -t claude-bridge .
-docker run -p 3456:3456 -e ANTHROPIC_API_KEY=sk-ant-oat01-... claude-bridge
+docker run -p 3456:3456 claude-bridge
 ```
 
-### Docker Compose (with OpenClaw)
-
-Add to your `docker-compose.yml`:
-
-```yaml
-claude-bridge:
-  build: /path/to/claude-bridge
-  environment:
-    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-  ports:
-    - "3456:3456"
-  restart: unless-stopped
-```
-
-Then in `openclaw.json`, set the bridge provider's `baseUrl` to `http://claude-bridge:3456/v1`.
-
-### Local
-
-```bash
-npm install && npm run build
-ANTHROPIC_API_KEY=sk-ant-oat01-... npm start
-```
+The default bind is loopback (`127.0.0.1`); set `CLAUDE_BRIDGE_HOST=0.0.0.0`
+explicitly if you need to expose it (e.g. inside a container/LAN).
 
 ## Configuration
 
 | Env Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | (required) | OAuth token (`sk-ant-oat01-...`) or API key |
 | `CLAUDE_BRIDGE_PORT` | `3456` | Listen port |
-| `CLAUDE_BRIDGE_HOST` | `0.0.0.0` | Bind address |
-| `CLAUDE_BRIDGE_TIMEOUT_MS` | `300000` | Request timeout (ms) |
-| `CLAUDE_BRIDGE_MODEL_MAP` | `{}` | JSON override for model mappings |
-| `CLAUDE_BRIDGE_DEBUG_PROMPT` | `0` | When `1`/`true`, log full request+response payloads to a JSONL file. **Off by default** — opt-in for debugging. |
-| `CLAUDE_BRIDGE_DEBUG_PROMPT_FILE` | `/tmp/claude-bridge-debug-YYYY-MM-DD.jsonl` | Override the default debug log path. |
+| `CLAUDE_BRIDGE_HOST` | `127.0.0.1` | Bind address (loopback by default) |
+| `CLAUDE_BRIDGE_TIMEOUT_MS` | `300000` | Per-request timeout (ms) |
+| `CLAUDE_BRIDGE_MAX_CONCURRENT` | `8` | Max concurrent CLI workers (global) |
+| `CLAUDE_BRIDGE_MAX_SESSIONS` | `200` | Legacy session-id LRU cap |
+| `CLAUDE_BRIDGE_MAX_BODY_BYTES` | `67108864` | Max request body size (64 MiB) → 413 |
+| `CLAUDE_BRIDGE_PATH_D` | `1` | Persistent sessions; `0` to disable |
+| `CLAUDE_BRIDGE_MCP_PORT` | `0` | In-process MCP server port (`0` = ephemeral) |
+| `CLAUDE_BRIDGE_IDLE_EVICT_MS` | `600000` | Tear down a Path-D session after this idle time |
+| `CLAUDE_BRIDGE_MAX_LIFETIME_MS` | `3600000` | Max Path-D session lifetime before respawn |
+| `CLAUDE_BRIDGE_MAX_PERSISTENT_SESSIONS` | `32` | Max simultaneous Path-D sessions |
+| `CLAUDE_BRIDGE_PATHD_MAX_TURNS` | `16` | Max CLI turns per Path-D message |
+| `CLAUDE_BRIDGE_DEBUG_PROMPT` | `0` | `1`/`true` logs full request+response payloads |
+| `CLAUDE_BRIDGE_DEBUG_PROMPT_FILE` | `~/.openclaw/bridge-debug/claude-bridge-debug-YYYY-MM-DD.jsonl` | Debug log path |
 
-## Debugging
+Invalid numeric values (e.g. a typo like `5min`) fall back to the documented
+default with a warning rather than silently disabling a limit.
 
-### Capturing full request payloads
+### Per-request headers
 
-When agents are misbehaving (hallucinating, ignoring instructions, calling tools wrong), enable the debug logger to capture exactly what the bridge sent to the underlying CLI:
-
-```bash
-CLAUDE_BRIDGE_DEBUG_PROMPT=1 npm start
-```
-
-Or via Docker Compose:
-
-```yaml
-claude-bridge:
-  environment:
-    CLAUDE_BRIDGE_DEBUG_PROMPT: "1"
-```
-
-Each request appends two JSON-lines records to `/tmp/claude-bridge-debug-YYYY-MM-DD.jsonl`:
-- A `phase: "request"` record with system prompt length, tool schemas (hashed), and the full user content / messages
-- A `phase: "response"` record with stop reason, tool calls emitted, and a 500-char preview of assistant text
-
-To find a specific conversation, search for the `sessionKey`:
-
-```bash
-grep '"sessionKey":"agent:sofia:..."' /tmp/claude-bridge-debug-*.jsonl | jq .
-```
-
-**Off by default**. The flag adds I/O on every request when on, so leave it disabled in normal operation. Logs may contain sensitive content from message bodies — handle accordingly.
+| Header | Values | Effect |
+|---|---|---|
+| `X-Bridge-Effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max` | CLI `--effort` passthrough |
+| `X-Bridge-Ultracode` | `1`/`true` | Force `xhigh` + inject an ultracode system-reminder |
 
 ## Available Models
 
-| Bridge ID | Anthropic Model | Context |
-|---|---|---|
-| `claude-opus-4` | `claude-opus-4-20250514` | 200K |
-| `claude-sonnet-4` | `claude-sonnet-4-5-20250514` | 200K |
-| `claude-haiku-4` | `claude-haiku-4-5-20251001` | 200K |
+The bridge maps friendly ids to the `claude` CLI's `--model` aliases; the CLI
+resolves each alias to whatever current Anthropic model it points at.
 
-Any unrecognized model name is passed through to Anthropic as-is.
+| Bridge ID (`/v1/models`) | CLI `--model` alias |
+|---|---|
+| `claude-opus-4` | `opus` |
+| `claude-sonnet-4` | `sonnet` |
+| `claude-haiku-4` | `haiku` |
+
+Any unrecognized model id is passed through to the CLI verbatim.
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/health` | GET | Health check |
+| `/health`, `/healthz` | GET | Health check + version |
+| `/metrics` | GET | Queue depth, lifetime counts, avg latency (counts only, no content) |
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Chat completions (streaming + non-streaming) |
 
-## Extracting OAuth Token
+## Debugging
 
-From macOS with Claude Code installed:
+Capture exactly what the bridge sent to the CLI when agents misbehave:
 
 ```bash
-security find-generic-password -s "Claude Code-credentials" -a "$(whoami)" -w \
-  | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['claudeAiOauth']['accessToken'])"
+CLAUDE_BRIDGE_DEBUG_PROMPT=1 npm start
 ```
 
-Token expires periodically. When it does, re-extract and update `ANTHROPIC_API_KEY`.
+Each request appends two JSON-lines records to
+`~/.openclaw/bridge-debug/claude-bridge-debug-YYYY-MM-DD.jsonl` (owner-only,
+`0600`): a `phase: "request"` record (system-prompt length, hashed tool
+schemas, the user content/messages) and a `phase: "response"` record (stop
+reason, tool calls, a preview of assistant text).
+
+```bash
+grep '"sessionKey":"agent:sofia:..."' ~/.openclaw/bridge-debug/*.jsonl | jq .
+```
+
+**Off by default** — it adds I/O per request and the records contain raw
+message bodies, so keep it disabled in normal operation.
 
 ## License
 
