@@ -160,3 +160,45 @@ The shape proves the thesis: `server.ts`/`translate.ts` are untouched, the SDK l
 ---
 
 **One-line summary for the standup:** The SDK keeps our $0-Max economics and deletes ~47% of the bridge (the whole park-and-resolve layer), so it's worth migrating — but behind a `CLAUDE_BRIDGE_ENGINE=cli|sdk` flag, default-CLI, gated on a one-day spike that proves the `canUseTool`-deny tool-parking trick and `--effort` parity, because those two are the only things that can quietly make it impossible.
+
+---
+
+## 7. Decision (2026-06-17, after an adversarial decision panel)
+
+**DECISION: do NOT build the SDK engine now, and do NOT default to it. Keep the CLI as the default engine indefinitely. Build the SDK engine reactively, only when a real trigger fires. This document IS the ready-to-execute plan.**
+
+### Two gating unknowns RESOLVED (favorably) by the panel
+
+- **Tool-parking across an HTTP turn — PROVEN possible** in Meridian's production code (1.4k★), and the mechanism is now known to copy (NOT the `canUseTool`-deny we'd assumed):
+  - in-process MCP server registers the client's tool defs (no-op handlers) so the model emits structured `tool_use` — registered **alphabetically for prompt-cache stability** (`src/proxy/passthroughTools.ts`);
+  - a **`PreToolUse` hook returning `decision: "block"`** captures the tool_use and halts the turn (`src/proxy/server.ts`);
+  - resume via **`resume: sessionId`** sending **only the new user message** (which carries the client's `tool_result`); the SDK reconstructs prior context (`src/proxy/query.ts`, `src/proxy/messages.ts`);
+  - sessions re-matched by content fingerprints (`lineageHash`/`messageHashes`) if the client doesn't echo the session id.
+  - **Caveat (per red-team):** the load-bearing block-hook + resume code was *attested in prose + one confirming comment*, only the no-op MCP server was quoted verbatim — **read Meridian's hook source directly before building Stage 2.**
+  - **Sharp edges to design around (Meridian open issues):** #528 duplicate `tool_use` blocks on parallel tool calls; #496 model-side tool reliability; #516/#495 `400 "out of extra usage"` recurs through the proxy (same class we hit on jarvis 2026-06-10).
+- **Effort `xhigh`/`max` — CONFIRMED** in installed `sdk.d.ts@0.3.156`: `effort?: EffortLevel` where `EffortLevel = 'low'|'medium'|'high'|'xhigh'|'max'`. No regression. (`xhigh` silently downgrades to `high` on non-capable models — but the CLI drives the *same binary*, so no SDK-vs-CLI delta; nothing to assert per-request.)
+- **Resume — STABLE** V1 top-level Option (no `unstable_*`/`@experimental` markers). Safe.
+- **Rate-limit — exposed** via `SDKRateLimitEvent` (camelCase `status`/`utilization`/`resetsAt`); needs a small field-rename adapter vs today's stream-json. Minor.
+
+### Why defer, and why NOT default to SDK
+
+1. **No nameable benefit today.** Same `claude` binary, same OAuth/Max entitlement, same **account-wide shared quota** (proven in 2026-06-10 deep-dive — the wall is not per-engine), same $0, same latency. The only prize is maintenance relief, and it's collectable later.
+2. **ToS asymmetry.** Anthropic's docs frame raw `claude -p` as *ordinary Claude Code use* (tolerated) but name the Agent SDK as the *build-products → use API key* path; `CLAUDE_CODE_OAUTH_TOKEN` is undocumented in the SDK types. Defaulting the fleet to the SDK voluntarily walks subscription traffic onto the more-restricted-as-documented lane. (Red-team softens "strictly dominated" → "weakly dominated under detection-uncertainty" — both drive the same binary/token so server-side distinguishability is unproven — but the precautionary call stands: don't volunteer onto it.)
+3. **Maintenance relief is real but re-earned, not free.** ~1,100–1,300 LOC of incident-prone code collapses, but error-as-content, quota-window handling, and fuzzy-id get re-earned on the new substrate; net LOC ~flat, the cost is *trust* (weeks of live cron validation), not code.
+4. **Anthropic promises advance notice** before any billing/auth change → the correct posture is reactive, not pre-paid.
+
+### "Fall back to CLI if anything" — yes, but as an OPERATOR switch, not automatic
+
+A per-request "try SDK, catch → CLI" fallback is **not achievable**: once a byte hits the SSE stream (`committed`), a retry corrupts it; a mid-conversation SDK session death can't fail over without a full re-prime; and every fallback **double-spends the shared Max quota**. The rollback must be a coarse env flip + restart (mirroring the existing `CLAUDE_BRIDGE_PATH_D=0` pattern), never a per-turn safety net.
+
+### The ONE make-or-break hard gate (only when building)
+
+**Stage-0 spike (~1 day): prove the SDK rides the same Keychain OAuth at $0 with no API key.** If it can't (forces per-token billing) or `CLAUDE_CODE_OAUTH_TOKEN` gets revoked for SDK use → the swap is pointless/impossible and this doc is the whole deliverable.
+
+### Action taken now
+
+This decision + the resolved unknowns recorded here. **Nothing built**: no `@anthropic-ai/claude-agent-sdk` dependency, no engine, no seam refactor, no default change. (The engine-seam refactor is also deferred — a single-implementation `Engine` interface is premature abstraction until the engine actually exists.)
+
+### Triggers to revisit (build Stage 2 then)
+
+Anthropic blesses Agent-SDK-over-subscription-OAuth as supported; OR the CLI path is deprecated/breaks unshimmably; OR the SDK delivers a benefit nameable in dollars/seconds/quota. None exist as of 2026-06-17.
