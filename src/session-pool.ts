@@ -554,10 +554,11 @@ export class PersistentSessionPool {
       // multi-step crons (juan-upwork, *-self-maintenance) legitimately chain
       // more tool calls within a single bridge message and were hitting
       // "Reached maximum number of turns (8)" → the gateway saw a FailoverError
-      // timeout (the retry usually succeeded → flaky). Raised to 16 (env-tunable)
-      // to absorb them; the CLI still terminates on end_turn and the v3.6.1
-      // timeout/teardown safety still bounds runaway sessions. Local bridge
-      // patch — re-apply after a bridge update.
+      // timeout (the retry usually succeeded → flaky). Raised to 16 (env-tunable
+      // via CLAUDE_BRIDGE_PATHD_MAX_TURNS) to absorb them; the CLI still
+      // terminates on end_turn and the v3.6.1 timeout/teardown safety still
+      // bounds runaway sessions. Committed to the fork's git (no longer a
+      // re-apply-after-update local patch).
       "--max-turns",
       String(Number(process.env.CLAUDE_BRIDGE_PATHD_MAX_TURNS) || 16),
       "--tools",

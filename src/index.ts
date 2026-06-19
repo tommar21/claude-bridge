@@ -6,7 +6,7 @@ import {
 } from "./cli-worker.js";
 import { BridgeMcpHttpServer } from "./mcp-http.js";
 import { PersistentSessionPool } from "./session-pool.js";
-import { configureDebugLogger } from "./debug-logger.js";
+import { configureDebugLogger, defaultDebugLogPath } from "./debug-logger.js";
 import { intEnv } from "./env.js";
 
 const port = intEnv("CLAUDE_BRIDGE_PORT", 3456, { min: 0, max: 65535 });
@@ -64,7 +64,7 @@ console.log(`  Bind:           ${host}:${port}`);
 console.log(`  API:            http://${host}:${port}/v1/chat/completions`);
 console.log(`  Path D:         ${pathDEnabled ? "enabled" : "disabled"} (MCP on 127.0.0.1:${mcpPort})`);
 console.log(
-  `  Debug log:      ${debugPromptEnabled ? `enabled (${debugPromptFile ?? `/tmp/claude-bridge-debug-${new Date().toISOString().slice(0, 10)}.jsonl`})` : "disabled"}`,
+  `  Debug log:      ${debugPromptEnabled ? `enabled (${debugPromptFile ?? defaultDebugLogPath()})` : "disabled"}`,
 );
 console.log("");
 

@@ -10,6 +10,21 @@ interface DebugConfig {
 
 let config: DebugConfig = { enabled: false, filePath: "" };
 
+/**
+ * Resolve the default debug-log path for the current day. Single source of
+ * truth so the startup banner and the logger agree on where records land
+ * (owner-only `~/.openclaw/bridge-debug/...`, never world-readable `/tmp`).
+ */
+export function defaultDebugLogPath(date?: string): string {
+  const day = date ?? new Date().toISOString().slice(0, 10);
+  return path.join(
+    os.homedir(),
+    ".openclaw",
+    "bridge-debug",
+    `claude-bridge-debug-${day}.jsonl`,
+  );
+}
+
 export function configureDebugLogger(opts: {
   enabled: boolean;
   filePath?: string;
@@ -18,18 +33,10 @@ export function configureDebugLogger(opts: {
     config = { enabled: false, filePath: "" };
     return;
   }
-  const date = new Date().toISOString().slice(0, 10);
   // Default under a private, owner-only dir rather than world-readable /tmp:
   // these records contain raw prompt + model-output bodies. mkdir 0700 here +
   // append 0600 below keep them readable only by the bridge user.
-  const filePath =
-    opts.filePath ??
-    path.join(
-      os.homedir(),
-      ".openclaw",
-      "bridge-debug",
-      `claude-bridge-debug-${date}.jsonl`,
-    );
+  const filePath = opts.filePath ?? defaultDebugLogPath();
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   } catch {

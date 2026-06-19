@@ -64,6 +64,9 @@ Point your OpenAI-compatible client's base URL at `http://127.0.0.1:3456/v1`.
 
 ### Docker
 
+> Note: the canonical deploy here is **native** (run via `bootstrap.sh`); the
+> Docker path below is kept for portability but is not how this host runs.
+
 ```bash
 docker build -t claude-bridge .
 docker run -p 3456:3456 claude-bridge
@@ -138,7 +141,7 @@ schemas, the user content/messages) and a `phase: "response"` record (stop
 reason, tool calls, a preview of assistant text).
 
 ```bash
-grep '"sessionKey":"agent:sofia:..."' ~/.openclaw/bridge-debug/*.jsonl | jq .
+grep '"sessionKey":"agent:veronica:..."' ~/.openclaw/bridge-debug/*.jsonl | jq .
 ```
 
 **Off by default** — it adds I/O per request and the records contain raw
